@@ -2,401 +2,442 @@
 # -*- coding: utf-8 -*-
 
 """
-Filter QA datasets (SQuAD v2.0 / HotpotQA / Natural Questions) by removing
-items a small model can already answer (zero-shot).
+Multi-backend (vLLM / SGLang / Transformers) data cleaning:
+- Filter out "easy" samples that a small model can already solve.
+- Default backend: vLLM (Ascend: use vLLM-Ascend).
+- Dataset adapters live in adapter/*.py (must implement load(args)->List[Example]).
+- Supports extractive QA (SQuADv2/Hotpot/NQ) and math QA (AQuA/GSM8K/MATH).
 
-- Auto-download via 🤗 Datasets (or read local SQuAD-like JSON).
-- Normalize to official SQuAD nested structure: {version, data:[{title, paragraphs:[{context, qas:[...]}]}]}
-- Generate with any HF CausalLM (e.g., Qwen 0.xB).
-- Score with SQuAD EM/F1. "Correct" = EM==1 or F1>=threshold (default 0.8).
-- Optional handling for unanswerable (SQuAD v2.0 / some NQ cases).
-- Save filtered JSON + a CSV log.
+Outputs:
+  - --output <*.jsonl>: filtered examples (one JSON per line; same schema).
+  - --save_csv <*.csv>: decision log (optional).
+  - --export_squad_like: extra SQuAD-like JSON (extractive only).
 
-Examples:
-SQuAD v2.0 (validation):
-python filter_qa_three_datasets.py \
-  --dataset squad_v2 --source hf --split validation \
-  --model Qwen/Qwen2-0.5B-Instruct --use_chat_template \
-  --include_unanswerable_hint --handle_unanswerable \
-  --device cuda --temperature 0.0 \
-  --output squadv2.valid.filtered.json \
-  --save_csv squadv2.decisions.csv
-
-HotpotQA (distractor dev):
-python filter_qa_three_datasets.py \
-  --dataset hotpot_qa --hotpot_config distractor --source hf --split validation \
-  --model Qwen/Qwen2-0.5B-Instruct --use_chat_template \
-  --device cuda --temperature 0.0 \
-  --output hotpot.dev.filtered.json --save_csv hotpot.decisions.csv
-
-Natural Questions (long docs):
-python filter_qa_three_datasets.py \
-  --dataset nq --source hf --split validation \
-  --model Qwen/Qwen2-0.5B-Instruct --use_chat_template \
-  --include_unanswerable_hint --handle_unanswerable \
-  --device cuda --temperature 0.0 \
-  --output nq.valid.filtered.json --save_csv nq.decisions.csv
+Usage (Ascend 910B, vLLM-Ascend, 4 cards):
+  export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+  python data_cleaning.py \
+      --backend vllm --tp 4 \
+      --dataset squadv2 --source json --input datasets/SQuAD/dev-v2.0.json \
+      --model /data/models/Qwen2.5-0.5B-Instruct \
+      --tokenizer_path /data/models/Qwen2.5-0.5B-Instruct \
+      --use_chat_template --include_unanswerable_hint --handle_unanswerable \
+      --temperature 0.0 --batch_size 8 \
+      --output squadv2.filtered.jsonl --save_csv squadv2.decisions.csv
 """
 
-import argparse, json, re, string
-# 导入数学数据集适配器
-from adapter.gsm8k_adapter import to_squadlike as gsm8k_to_squadlike
-from adapter.aqua_adapter import to_squadlike as aqua_to_squadlike
-from adapter.math_adapter import to_squadlike as math_to_squadlike
-from adapter.squadv2_adapter import to_squadlike as squadv2_to_squadlike
-from adapter.hotpot_adapter import to_squadlike as hotpot_to_squadlike
-from adapter.nq_adapter import to_squadlike as nq_to_squadlike
+from __future__ import annotations
+import argparse, json, os, re, importlib, math
+from dataclasses import dataclass, asdict, field
+from typing import List, Tuple, Iterable, Dict, Any, Optional, Callable
 from collections import Counter
-from copy import deepcopy
-from typing import Any, Dict, Iterable, List, Tuple
-
-import torch
+from time import time
+from pathlib import Path
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ------------------------------
-# SQuAD metrics
-# ------------------------------
-_ARTICLES_RE = re.compile(r"\b(a|an|the)\b", re.UNICODE)
+# =============== Example schema ===============
+@dataclass
+class Example:
+    id: str
+    question: str
+    context: str
+    answers: List[str]
+    is_unanswerable: bool = False
+    meta: Dict[str, Any] = field(default_factory=dict)
 
-def _normalize_answer(s: str) -> str:
-    def lower(text): return text.lower()
-    def remove_articles(text): return _ARTICLES_RE.sub(" ", text)
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-    def white_space_fix(text): return " ".join(text.split())
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
+# =============== CLI ===============
+def build_args():
+    ap = argparse.ArgumentParser("Filter 'easy' samples with a small model.")
 
-def exact_match_score(prediction: str, ground_truth: str) -> float:
-    return float(_normalize_answer(prediction) == _normalize_answer(ground_truth))
+    # dataset
+    ap.add_argument("--dataset", required=True,
+                    choices=["squadv2", "hotpot", "nq", "aqua", "gsm8k", "math"])
+    ap.add_argument("--source", choices=["hf", "json"], default="hf")
+    ap.add_argument("--input", type=str, default=None, help="Local file path when --source=json")
+    ap.add_argument("--split", type=str, default="validation")
 
-def f1_score(prediction: str, ground_truth: str) -> float:
-    pred_tokens = _normalize_answer(prediction).split()
-    gold_tokens = _normalize_answer(ground_truth).split()
-    if len(pred_tokens) == 0 and len(gold_tokens) == 0:
-        return 1.0
-    if len(pred_tokens) == 0 or len(gold_tokens) == 0:
-        return 0.0
-    common = Counter(pred_tokens) & Counter(gold_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(gold_tokens)
-    return 2 * precision * recall / (precision + recall)
+    # backends
+    ap.add_argument("--backend", choices=["vllm", "sglang", "hf"], default="vllm")
+    ap.add_argument("--model", type=str, required=True, help="HF repo or local dir (or SGLang model name)")
+    ap.add_argument("--tokenizer_path", type=str, default=None)
+    ap.add_argument("--local_files_only", action="store_true")
+    ap.add_argument("--use_chat_template", action="store_true")
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top_p", type=float, default=1.0)
+    ap.add_argument("--max_input_tokens", type=int, default=2048)
+    ap.add_argument("--max_new_tokens", type=int, default=64)
 
-def metric_match(pred: str, gold_list: List[str], f1_threshold: float = 0.8) -> Tuple[bool, float, float]:
-    if not gold_list:
-        return False, 0.0, 0.0
-    ems = [exact_match_score(pred, g) for g in gold_list]
-    f1s = [f1_score(pred, g) for g in gold_list]
-    best_em = max(ems) if ems else 0.0
-    best_f1 = max(f1s) if f1s else 0.0
-    ok = (best_em == 1.0) or (best_f1 >= f1_threshold)
-    return ok, best_em, best_f1
+    # vLLM
+    ap.add_argument("--tp", type=int, default=1, help="Tensor parallel size (multi-card) for vLLM")
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.90)
 
-# ------------------------------
-# Unanswerable heuristic
-# ------------------------------
-DEFAULT_NO_ANSWER_PATTERNS = [
-    "unanswerable",
-    "cannot be determined",
-    "cannot be answered",
-    "not provided in the context",
-    "not mentioned in the passage",
-    "insufficient information",
-    "no answer",
-    "unknown",
-]
+    # SGLang client (OpenAI-compatible API)
+    ap.add_argument("--sglang_api_base", type=str, default=os.getenv("SGLANG_API_BASE", "http://127.0.0.1:30000"))
+    ap.add_argument("--sglang_api_key", type=str, default=os.getenv("SGLANG_API_KEY", None))
+    ap.add_argument("--sglang_model", type=str, default=None, help="If server uses alias different from --model")
+    ap.add_argument("--concurrency", type=int, default=8, help="SGLang client concurrency")
 
-def looks_like_no_answer(text: str, patterns: List[str]) -> bool:
-    t = text.strip().lower()
-    for p in patterns:
-        if p in t:
-            return True
-    return False
+    # HF
+    ap.add_argument("--device", type=str, default="cuda", help="cuda / cpu / npu:0")
+    ap.add_argument("--device_map", type=str, default=None, help='Transformers: e.g., "auto"')
 
-# ------------------------------
-# SQuAD-like nested iter + remove
-# ------------------------------
-def squad_iter_nested(js: Dict[str, Any]) -> Iterable[Tuple[Tuple, Dict[str, Any]]]:
-    """Yield ((ai, pi, qi), sample_dict) from official SQuAD-like nested structure."""
-    for ai, article in enumerate(js["data"]):
-        for pi, para in enumerate(article.get("paragraphs", [])):
-            context = para.get("context", "")
-            for qi, qa in enumerate(para.get("qas", [])):
-                qid = qa.get("id", f"a{ai}_p{pi}_q{qi}")
-                question = qa.get("question", "")
-                is_imp = bool(qa.get("is_impossible", False))
-                answers = qa.get("answers", [])
-                golds = [a["text"] for a in answers if isinstance(a, dict) and "text" in a]
-                yield (ai, pi, qi), {
-                    "id": qid,
-                    "question": question,
-                    "context": context,
-                    "is_impossible": is_imp,
-                    "answers": golds,
-                }
+    # filtering & outputs
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--f1_threshold", type=float, default=0.8)
+    ap.add_argument("--export_squad_like", action="store_true")
+    ap.add_argument("--output", type=str, required=True)
+    ap.add_argument("--save_csv", type=str, default=None)
 
-def nested_remove(js: Dict[str, Any], remove_paths: set) -> Dict[str, Any]:
-    """Return deep-copied json with selected qas removed."""
-    out = deepcopy(js)
-    new_data = []
-    for ai, article in enumerate(out["data"]):
-        new_paragraphs = []
-        for pi, para in enumerate(article.get("paragraphs", [])):
-            qas = para.get("qas", [])
-            kept_qas = []
-            for qi, qa in enumerate(qas):
-                if (ai, pi, qi) not in remove_paths:
-                    kept_qas.append(qa)
-            if kept_qas:
-                para["qas"] = kept_qas
-                new_paragraphs.append(para)
-        if new_paragraphs:
-            article["paragraphs"] = new_paragraphs
-            new_data.append(article)
-    out["data"] = new_data
-    return out
+    # dataset hints
+    ap.add_argument("--include_unanswerable_hint", action="store_true")
+    ap.add_argument("--handle_unanswerable", action="store_true")
+    ap.add_argument("--hotpot_config", type=str, default="distractor")
 
+    return ap.parse_args()
 
+# =============== Adapters ===============
+ADAPTER_REG = {
+    "squadv2": "adapter.squadv2_adapter",
+    "hotpot":  "adapter.hotpot_adapter",
+    "nq":      "adapter.nq_adapter",
+    "aqua":    "adapter.aqua_adapter",
+    "gsm8k":   "adapter.gsm8k_adapter",
+    "math":    "adapter.math_adapter",
+}
 
+def load_by_adapter(args) -> Tuple[List[Example], Any]:
+    mod = importlib.import_module(ADAPTER_REG[args.dataset])
+    if not hasattr(mod, "load"):
+        raise AttributeError(f"{ADAPTER_REG[args.dataset]} must implement load(args)->List[Example]")
+    raw = mod.load(args)
+    exs: List[Example] = []
+    for x in raw:
+        if isinstance(x, Example):
+            exs.append(x)
+        elif isinstance(x, dict):
+            exs.append(Example(
+                id=str(x.get("id")),
+                question=x.get("question",""),
+                context=x.get("context",""),
+                answers=list(x.get("answers", [])),
+                is_unanswerable=bool(x.get("is_unanswerable", False)),
+                meta={k:v for k,v in x.items() if k not in ["id","question","context","answers","is_unanswerable"]}
+            ))
+        else:
+            raise TypeError("Adapter.load must return Example or dict.")
+    return exs, mod
 
-# ------------------------------
-# Prompting & generation
-# ------------------------------
-SYS_MSG = "You are a helpful assistant."
-USER_TMPL = (
-    "Answer the question based on the given context. "
-    "Respond with a short, direct answer.\n\n"
-    "{unans_hint}"
-    "Context:\n{context}\n\n"
-    "Question: {question}\n"
-    "Answer:"
-)
+# =============== Extractive metrics (EM/F1) ===============
+_ART = re.compile(r"\b(a|an|the)\b", re.UNICODE)
+def _norm(s: str) -> str:
+    s = s.lower()
+    s = _ART.sub(" ", s)
+    s = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
+    return " ".join(s.split())
 
-def build_prompt(tokenizer, question: str, context: str, use_chat: bool, include_unans_hint: bool) -> str:
-    hint = "If the answer cannot be found in the context, reply with 'unanswerable'.\n\n" if include_unans_hint else ""
-    user_text = USER_TMPL.format(unans_hint=hint, context=context, question=question)
-    if use_chat and hasattr(tokenizer, "apply_chat_template"):
-        messages = [{"role": "system", "content": SYS_MSG},
-                    {"role": "user", "content": user_text}]
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return f"{SYS_MSG}\n\n{user_text}"
+def f1(pred: str, gold: str) -> float:
+    pt, gt = _norm(pred).split(), _norm(gold).split()
+    if not pt or not gt: return float(pt == gt)
+    common = Counter(pt) & Counter(gt)
+    n = sum(common.values())
+    if n == 0: return 0.0
+    P, R = n/len(pt), n/len(gt)
+    return 2*P*R/(P+R)
 
-def truncate_context(tokenizer, question: str, context: str, max_input_tokens: int) -> str:
-    reserve = max(128, min(512, max_input_tokens // 6))  # room for question & overhead
-    q_tokens = tokenizer.encode(question, add_special_tokens=False)
-    budget = max(1, max_input_tokens - len(q_tokens) - reserve)
-    ctx_tokens = tokenizer.encode(context, add_special_tokens=False)
-    if len(ctx_tokens) <= budget:
-        return context
-    tail = tokenizer.decode(ctx_tokens[-budget:], skip_special_tokens=True)
-    return tail
+def match_extractive(pred: str, golds: List[str], thr: float=0.8) -> Tuple[bool,float,float]:
+    if not golds: return False, 0.0, float(_norm(pred)=="")
+    f1s = [f1(pred,g) for g in golds]
+    ems = [float(_norm(pred)==_norm(g)) for g in golds]
+    return (max(f1s)>=thr or max(ems)>=1.0, max(f1s), max(ems))
 
-@torch.inference_mode()
-def generate_answer(model, tokenizer, prompt: str, device: str, max_new_tokens: int = 64, temperature: float = 0.0) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    gen_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=(temperature > 0.0),
-        temperature=temperature if temperature > 0 else None,
-        top_p=1.0,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=pad_id,
+# =============== Math metrics ===============
+_BOXED = re.compile(r"\\boxed\{([^}]*)\}")
+_FRAC  = re.compile(r"\\frac\{([^}]*)\}\{([^}]*)\}")
+_PCT   = re.compile(r"^(-?\d+(?:\.\d+)?)\s*%$")
+
+def _strip_tex(s: str) -> str:
+    s = s.strip()
+    m = _BOXED.search(s)
+    if m: s = m.group(1)
+    s = s.replace("$","")
+    s = _FRAC.sub(lambda m: str(float(m.group(1))/float(m.group(2)) if m.group(2)!='0' else m.group(1)), s)
+    return " ".join(s.replace(",", " ").split())
+
+def _num(s: str) -> Optional[float]:
+    s = _strip_tex(s)
+    if "####" in s: s = s.split("####")[-1].strip()
+    m = _PCT.match(s)
+    if m:
+        try: return float(m.group(1)) / 100.0
+        except: pass
+    nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+    if not nums: return None
+    try: return float(nums[-1])
+    except: return None
+
+def match_math(pred: str, golds: List[str]) -> Tuple[bool,float,float]:
+    pn = _num(pred)
+    for g in golds:
+        gn = _num(g)
+        if pn is not None and gn is not None:
+            if gn == 0:
+                if abs(pn) <= 1e-9: return True, 0.0, 1.0
+            else:
+                rel = abs(pn-gn)/(abs(gn)+1e-12)
+                if rel <= 1e-6: return True, rel, float(pn==gn)
+    # fallback textual
+    pt = _norm(_strip_tex(pred))
+    gts = [_norm(_strip_tex(g)) for g in golds]
+    hit = pt in gts
+    return hit, (0.0 if hit else 1.0), float(hit)
+
+# =============== Prompt builders ===============
+def default_prompt(ex: Example, tokenizer=None, use_chat_template=False,
+                   include_unanswerable_hint=False, handle_unanswerable=False,
+                   task_type: str="extractive") -> str:
+    if task_type == "extractive":
+        hint = "\nIf the question cannot be answered from the context, reply with: 'unanswerable'." \
+               if include_unanswerable_hint else ""
+        content = f"Context:\n{ex.context}\n\nQuestion: {ex.question}\nAnswer:{hint}\n"
+        if use_chat_template and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            msgs=[{"role":"system","content":"You are a helpful RC assistant."},
+                  {"role":"user","content":content}]
+            return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return content
+
+    # math
+    content = (
+        "Solve the following problem. Respond with the final numeric answer only. "
+        "If it is a fraction/percentage, give the numeric form.\n"
+        f"Problem: {ex.question}\nAnswer:"
     )
-    out_ids = gen_ids[0][inputs["input_ids"].shape[1]:]
-    text = tokenizer.decode(out_ids, skip_special_tokens=True)
-    return text.strip().split("\n")[0].strip()
+    if use_chat_template and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        msgs=[{"role":"system","content":"You are a careful math solver."},
+              {"role":"user","content":content}]
+        return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    return content
 
-# ------------------------------
-# IO helpers
-# ------------------------------
-def read_squad_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# =============== Backends ===============
+def build_generator(args):
+    """
+    Return: tokenizer_like, generate_batch(prompts)->List[str], max_model_len
+    """
+    max_model_len = args.max_input_tokens + args.max_new_tokens
 
-def write_json(obj: Dict[str, Any], path: str):
+    # ---------- vLLM (default) ----------
+    if args.backend == "vllm":
+        from vllm import LLM, SamplingParams
+        llm = LLM(
+            model=args.model,
+            tokenizer=args.tokenizer_path or args.model,
+            tensor_parallel_size=args.tp,                 # multi-card here
+            max_model_len=max_model_len,
+            trust_remote_code=True,
+            dtype="half",
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
+        tok = llm.get_tokenizer()
+        sp = SamplingParams(temperature=args.temperature, top_p=args.top_p,
+                            max_tokens=args.max_new_tokens)
+
+        def _gen_batch(prompts: List[str]) -> List[str]:
+            outs = llm.generate(prompts, sp)
+            return [o.outputs[0].text for o in outs]
+
+        return tok, _gen_batch, max_model_len
+
+    # ---------- SGLang (OpenAI-compatible client) ----------
+    if args.backend == "sglang":
+        import requests, concurrent.futures
+        # 为了 chat template，我们尽量加载本地 tokenizer；失败也不影响调用
+        tok = None
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(
+                args.tokenizer_path or args.model,
+                trust_remote_code=True, local_files_only=args.local_files_only
+            )
+        except Exception:
+            tok = None
+
+        api_base = args.sglang_api_base.rstrip("/")
+        model_id = args.sglang_model or args.model
+        headers = {"Content-Type":"application/json"}
+        if args.sglang_api_key:
+            headers["Authorization"] = f"Bearer {args.sglang_api_key}"
+
+        def _one(prompt: str) -> str:
+            # 用 chat.completions 端点
+            payload = {
+                "model": model_id,
+                "messages": [{"role":"user","content": prompt}],
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "max_tokens": args.max_new_tokens
+            }
+            r = requests.post(f"{api_base}/v1/chat/completions",
+                              headers=headers, data=json.dumps(payload), timeout=120)
+            r.raise_for_status()
+            js = r.json()
+            return js["choices"][0]["message"]["content"]
+
+        def _gen_batch(prompts: List[str]) -> List[str]:
+            # 简单并发客户端（服务器端负责多卡/并行）
+            outs = [None]*len(prompts)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,args.concurrency)) as ex:
+                futs = {ex.submit(_one, p): idx for idx,p in enumerate(prompts)}
+                for fut in concurrent.futures.as_completed(futs):
+                    idx = futs[fut]
+                    try:
+                        outs[idx] = fut.result()
+                    except Exception as e:
+                        outs[idx] = f"[ERROR:{e}]"
+            return outs
+
+        return tok, _gen_batch, max_model_len
+
+    # ---------- Transformers ----------
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import torch
+    tok = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=True, local_files_only=args.local_files_only
+    )
+    model_kwargs = dict(trust_remote_code=True, local_files_only=args.local_files_only)
+    if args.device_map:
+        model_kwargs["device_map"] = args.device_map  # e.g., "auto" (multi-card if supported)
+    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+
+    # device placement
+    if not args.device_map:
+        if args.device.startswith("cuda"):
+            model = model.to("cuda")
+        elif args.device.startswith("npu"):
+            import torch_npu  # noqa
+            model = model.to(args.device)
+        else:
+            model = model.to("cpu")
+
+    def _gen_batch(prompts: List[str]) -> List[str]:
+        outs = []
+        for p in prompts:
+            inputs = tok(p, return_tensors="pt", truncation=True,
+                         max_length=args.max_input_tokens)
+            # move to device
+            if not args.device_map:
+                inputs = inputs.to(model.device)
+            gen = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                temperature=args.temperature,
+                eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id
+            )
+            text = tok.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            outs.append(text)
+        return outs
+
+    return tok, _gen_batch, max_model_len
+
+# =============== IO helpers ===============
+def write_jsonl(path: str, examples: Iterable[Example]):
+    with open(path, "w", encoding="utf-8") as f:
+        for ex in examples:
+            f.write(json.dumps(asdict(ex), ensure_ascii=False) + "\n")
+
+def write_csv(path: str, rows: List[Dict[str, Any]]):
+    import csv
+    keys = list(rows[0].keys()) if rows else []
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+def export_squad_like(path: str, examples: List[Example]):
+    data = []
+    paras = []
+    for ex in examples:
+        paras.append({
+            "context": ex.context,
+            "qas": [{
+                "id": ex.id,
+                "question": ex.question,
+                "answers": [{"text": a, "answer_start": -1} for a in ex.answers],
+                "is_impossible": ex.is_unanswerable
+            }]
+        })
+    data.append({"title":"filtered","paragraphs":paras})
+    obj = {"version":"filtered-1.0","data":data}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-# ------------------------------
-# Main
-# ------------------------------
+# =============== Main ===============
 def main():
-    ap = argparse.ArgumentParser(description="Filter QA datasets by removing items a small model already answers.")
-    # dataset selection & source
-    ap.add_argument("--dataset", choices=["squad_v2", "hotpot_qa", "nq", "gsm8k", "aqua", "math"], default="squad_v2",
-                    help="Choose which dataset to use.")
-    ap.add_argument("--source", choices=["hf", "json"], default="hf",
-                    help="Use 'hf' for HuggingFace download or 'json' for a local SQuAD-like JSON.")
-    ap.add_argument("--split", default="validation",
-                    help="HF split name (e.g., 'train'/'validation'). If not present, will fallback automatically.")
-    ap.add_argument("--input", default=None, help="Path to local SQuAD-like JSON when --source=json.")
-    ap.add_argument("--output", required=True, help="Path to write filtered JSON.")
-    ap.add_argument("--save_csv", default=None, help="Optional CSV to log per-item decisions.")
+    args = build_args()
 
-    # dataset-specific options
-    ap.add_argument("--hotpot_config", choices=["distractor", "fullwiki"], default="distractor",
-                    help="HotpotQA configuration to use when --dataset=hotpot_qa.")
+    # load data
+    print(f"[Load] dataset={args.dataset} source={args.source} split={args.split} input={args.input}")
+    examples, adapter_mod = load_by_adapter(args)
+    print(f"[Load] {len(examples)} examples")
 
-    # model & decoding
-    ap.add_argument("--model", required=True, help="HF model name or local path (e.g., Qwen/Qwen2-0.5B-Instruct).")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--use_chat_template", action="store_true",
-                    help="Use tokenizer.apply_chat_template if available (for chat/instruct models).")
-    ap.add_argument("--include_unanswerable_hint", action="store_true",
-                    help="Tell the model to output 'unanswerable' when no answer appears in context.")
-    ap.add_argument("--max_input_tokens", type=int, default=2048, help="Token cap for the prompt (context will be truncated).")
-    ap.add_argument("--max_new_tokens", type=int, default=64)
-    ap.add_argument("--temperature", type=float, default=0.0)
+    task_type = "extractive" if args.dataset in ("squadv2","hotpot","nq") else "math"
 
-    # scoring
-    ap.add_argument("--f1_threshold", type=float, default=0.8, help="Correct if EM==1 or F1>=threshold.")
-    ap.add_argument("--handle_unanswerable", action="store_true",
-                    help="Treat 'unanswerable' predictions as correct when gold answers empty.")
-    ap.add_argument("--no_answer_patterns", nargs="*", default=DEFAULT_NO_ANSWER_PATTERNS,
-                    help="Phrases indicating 'no answer' (lowercase).")
+    # backend
+    print(f"[Init] backend={args.backend} model={args.model}")
+    tokenizer, generate_batch, _ = build_generator(args)
 
-    ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
-    torch.manual_seed(args.seed)
+    # adapter-specific prompt if provided
+    build_prompt_fn: Optional[Callable] = getattr(adapter_mod, "build_prompt", None)
 
-    # Load model
-    print(f"[Load] model={args.model} device={args.device}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if args.device.startswith("cuda") else None,
-    )
-    if not args.device.startswith("cuda"):
-        model = model.to(args.device)
-
-    # Load data -> normalize to SQuAD-like nested JSON
-
-    if args.source == "hf":
-        print(f"[Data] loading via datasets: {args.dataset} / split={args.split}")
-        from datasets import load_dataset
-
-        if args.dataset == "squad_v2":
-            ds = load_dataset("squad_v2")
-            split_name = args.split if args.split in ds else ("validation" if "validation" in ds else "train")
-            nested = squadv2_to_squadlike(ds[split_name])
-
-        elif args.dataset == "hotpot_qa":
-            ds = load_dataset("hotpot_qa", args.hotpot_config)
-            split_name = args.split if args.split in ds else ("validation" if "validation" in ds else "train")
-            nested = hotpot_to_squadlike(ds[split_name])
-
-        elif args.dataset == "nq":
-            ds = load_dataset("natural_questions")
-            if args.split in ds:
-                split_name = args.split
-            elif "validation" in ds:
-                split_name = "validation"
-            elif "dev" in ds:
-                split_name = "dev"
-            elif "test" in ds:
-                split_name = "test"
-            else:
-                split_name = "train"
-            nested = nq_to_squadlike(ds[split_name])
-
-        elif args.dataset == "gsm8k":
-            ds = load_dataset("gsm8k")
-            split_name = args.split if args.split in ds else ("test" if "test" in ds else "train")
-            nested = gsm8k_to_squadlike(ds[split_name])
-
-        elif args.dataset == "aqua":
-            ds = load_dataset("aqua_rat")
-            split_name = args.split if args.split in ds else ("validation" if "validation" in ds else "train")
-            nested = aqua_to_squadlike(ds[split_name])
-
-        elif args.dataset == "math":
-            ds = load_dataset("math")
-            split_name = args.split if args.split in ds else ("test" if "test" in ds else "train")
-            nested = math_to_squadlike(ds[split_name])
-
-        else:
-            raise ValueError(f"Unknown dataset: {args.dataset}")
-
-    else:
-        if not args.input:
-            raise ValueError("--input is required when --source=json")
-        print(f"[Data] reading local SQuAD-like JSON: {args.input}")
-        nested = read_squad_json(args.input)
-
-    # Iterate & evaluate
-    items = list(squad_iter_nested(nested))
-    print(f"[Eval] total samples: {len(items)}")
-    remove_paths = set()
-    logs: List[Tuple[str, float, float, int, str]] = []
-
-    for (ai, pi, qi), ex in tqdm(items, desc="Evaluating"):
-        qid = ex["id"]
-        question = ex["question"] or ""
-        context = ex["context"] or ""
-        answers = ex["answers"] or []
-        is_imp = bool(ex.get("is_impossible", False))
-
-        # truncate context
-        if args.max_input_tokens:
-            context = truncate_context(tokenizer, question, context, args.max_input_tokens)
-
-        prompt = build_prompt(
-            tokenizer,
-            question=question,
-            context=context,
-            use_chat=args.use_chat_template,
-            include_unans_hint=args.include_unanswerable_hint
+    def make_prompt(ex: Example) -> str:
+        if build_prompt_fn is not None:
+            return build_prompt_fn(ex, tokenizer)
+        return default_prompt(
+            ex, tokenizer=tokenizer, use_chat_template=args.use_chat_template,
+            include_unanswerable_hint=args.include_unanswerable_hint,
+            handle_unanswerable=args.handle_unanswerable,
+            task_type=task_type
         )
 
-        pred = generate_answer(
-            model, tokenizer, prompt,
-            device=args.device,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature
-        )
+    bs = max(1, args.batch_size)
+    kept: List[Example] = []
+    logs: List[Dict[str, Any]] = []
 
-        # scoring
-        if (not is_imp) and len(answers) > 0:
-            ok, em, f1 = metric_match(pred, answers, f1_threshold=args.f1_threshold)
-        else:
-            # gold is unanswerable
-            if args.handle_unanswerable and looks_like_no_answer(pred, [p.lower() for p in args.no_answer_patterns]):
-                ok, em, f1 = True, 1.0, 1.0
+    t0 = time()
+    for i in tqdm(range(0, len(examples), bs), ncols=100, desc="Filtering"):
+        batch = examples[i:i+bs]
+        prompts = [make_prompt(ex) for ex in batch]
+        preds = generate_batch(prompts)
+
+        for ex, pred in zip(batch, preds):
+            pred = (pred or "").strip()
+            if task_type == "extractive":
+                hit, s1, s2 = match_extractive(pred, ex.answers, args.f1_threshold)
             else:
-                ok, em, f1 = False, 0.0, 0.0
+                hit, s1, s2 = match_math(pred, ex.answers)
 
-        logs.append((qid, em, f1, int(ok), pred))
-        if ok:
-            remove_paths.add((ai, pi, qi))
+            is_easy = bool(hit)  # hit = 小模型能答 → 过滤
+            if not is_easy:
+                kept.append(ex)
+            logs.append({
+                "id": ex.id, "dataset": args.dataset, "is_easy": int(is_easy),
+                "score1": s1, "score2": s2, "pred": pred,
+                "gold": ex.answers[0] if ex.answers else "",
+                "question": (ex.question[:120]+"...") if len(ex.question)>120 else ex.question
+            })
+    t1 = time()
+    print(f"[Done] kept {len(kept)} / {len(examples)} in {t1-t0:.1f}s")
 
-    # Remove & save
-    filtered = nested_remove(nested, remove_paths)
-    write_json(filtered, args.output)
-    removed = len(remove_paths)
-    kept = len(items) - removed
-    print(f"[Done] removed {removed} / {len(items)}; kept {kept}; wrote: {args.output}")
-
-    # CSV log
-    if args.save_csv:
-        try:
-            import csv
-            with open(args.save_csv, "w", newline="", encoding="utf-8") as cf:
-                w = csv.writer(cf)
-                w.writerow(["id", "EM", "F1", "Correct", "Prediction"])
-                for qid, em, f1, ok, pred in logs:
-                    w.writerow([qid, f"{em:.3f}", f"{f1:.3f}", ok, pred])
-            print(f"[Log] decisions saved to: {args.save_csv}")
-        except Exception as e:
-            print(f"[Warn] CSV save failed: {e}")
+    # outputs
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    write_jsonl(args.output, kept)
+    print(f"[Write] filtered jsonl -> {args.output}")
+    if args.save_csv and logs:
+        write_csv(args.save_csv, logs)
+        print(f"[Write] decisions csv -> {args.save_csv}")
+    if args.export_squad_like and task_type == "extractive":
+        p = Path(args.output).with_suffix(".squad.json")
+        export_squad_like(str(p), kept)
+        print(f"[Write] squad-like json -> {p}")
 
 if __name__ == "__main__":
     main()
