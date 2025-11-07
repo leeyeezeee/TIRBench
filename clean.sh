@@ -1,42 +1,38 @@
 MODEL_PATH=./Qwen3-VL-4B-Thinking
 TOKENIZER_PATH=$MODEL_PATH
 
-# 1. AQuA
+# AQuA
 python data_cleaning.py \
   --backend vllm \
   --dataset aqua \
-  --source hf \
-  --split validation \
+  --source json \
+  --input datasets/AQuA/validation-00000-of-00001.parquet \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 8 \
-  --max_input_tokens 2048 \
-  --max_new_tokens 64 \
-  --output outputs/aqua.json 
+  --output outputs/aqua.json \
   --tp 8
-# 2. GSM8K
+
+# GSM8K
 python data_cleaning.py \
   --backend vllm \
   --dataset gsm8k \
-  --source hf \
-  --split test \
+  --source json \
+  --input datasets/GSM8k/main/test-00000-of-00001.parquet \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 8 \
-  --max_input_tokens 2048 \
-  --max_new_tokens 64 \
-  --output outputs/gsm8k.json 
+  --output outputs/gsm8k.json \
   --tp 8
-# 3. MATH
+
+# MATH
 python data_cleaning.py \
   --backend vllm \
   --dataset math \
-  --source hf \
-  --split validation \
+  --source json \
+  --input datasets/MATH/test-00000-of-00001.parquet \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 4 \
-  --max_input_tokens 2048 \
-  --max_new_tokens 64 \
-  --output outputs/math.json 
+  --output outputs/math.json \
   --tp 8
