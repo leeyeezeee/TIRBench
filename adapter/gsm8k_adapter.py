@@ -68,3 +68,28 @@ def extract_final_answer(answer_text):
     
     return final_answer
 
+
+def build_prompt(ex, tokenizer=None):
+    """
+    GSM8K 专用 prompt，适合小学数学应用题
+    
+    GSM8K 包含小学阶段的多步骤应用题，需要清晰的数值答案
+    """
+    content = (
+        f"Solve this math word problem step by step.\n\n"
+        f"Problem: {ex.question}\n\n"
+        "Provide only the final numeric answer (no units, no explanation).\n"
+        "Answer:"
+    )
+    
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            msgs = [
+                {"role": "system", "content": "You are a helpful math tutor solving grade school word problems."},
+                {"role": "user", "content": content}
+            ]
+            return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        except:
+            pass
+    
+    return content
