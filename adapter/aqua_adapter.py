@@ -53,3 +53,30 @@ def load(args):
     return examples
 
 
+def build_prompt(ex, tokenizer=None):
+    """
+    AQuA 专用 prompt，强调选择选项标签
+    
+    AQuA 是多选题格式，需要模型从 A-E 中选择正确选项
+    """
+    # AQuA 的 context 包含选项列表
+    content = (
+        f"{ex.question}\n\n"
+        f"{ex.context}\n\n"
+        "Please select the correct option letter (A, B, C, D, or E) as your answer.\n"
+        "Respond with only the letter of the correct answer."
+    )
+    
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            msgs = [
+                {"role": "system", "content": "You are a precise math problem solver. Always respond with only the option letter."},
+                {"role": "user", "content": content}
+            ]
+            return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        except:
+            pass
+    
+    return content
+
+

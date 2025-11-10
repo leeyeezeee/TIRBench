@@ -9,7 +9,7 @@ Multi-backend (vLLM / SGLang / Transformers) data cleaning:
 - Supports extractive QA (SQuADv2/Hotpot/NQ) and math QA (AQuA/GSM8K/MATH).
 
 Outputs:
-  - --output <*.jsonl>: filtered examples (one JSON per line; same schema).
+  - --output <*.json>: filtered examples (single JSON array; same schema).
   - --save_csv <*.csv>: decision log (optional).
   - --export_squad_like: extra SQuAD-like JSON (extractive only).
 
@@ -84,7 +84,7 @@ def build_args():
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--f1_threshold", type=float, default=0.8)
     ap.add_argument("--export_squad_like", action="store_true")
-    ap.add_argument("--output", type=str, required=True)
+    ap.add_argument("--output", type=str, required=True, help="Filtered dataset JSON path")
     ap.add_argument("--save_csv", type=str, default=None)
 
     # dataset hints
@@ -338,10 +338,10 @@ def build_generator(args):
     return tok, _gen_batch, max_model_len
 
 # =============== IO helpers ===============
-def write_jsonl(path: str, examples: Iterable[Example]):
+def write_json(path: str, examples: Iterable[Example]):
+    data = [asdict(ex) for ex in examples]
     with open(path, "w", encoding="utf-8") as f:
-        for ex in examples:
-            f.write(json.dumps(asdict(ex), ensure_ascii=False) + "\n")
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 def write_csv(path: str, rows: List[Dict[str, Any]]):
     import csv
@@ -427,10 +427,41 @@ def main():
     t1 = time()
     print(f"[Done] kept {len(kept)} / {len(examples)} in {t1-t0:.1f}s")
 
+    # statistics
+    total = len(logs)
+    hits = sum(r["is_easy"] for r in logs)
+    accuracy = hits / total if total else 0.0
+    print(f"[Stats] accuracy={accuracy:.4f} ({hits}/{total})")
+
+    # summary export for math datasets
+    if args.dataset in ("aqua", "gsm8k", "math"):
+        summary_dir = Path("results") / "math_summary"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = summary_dir / f"{args.dataset}.json"
+        summary_payload = {
+            "dataset": args.dataset,
+            "total_examples": total,
+            "easy_examples": hits,
+            "filtered_examples": len(kept),
+            "accuracy": accuracy,
+            "parameters": {
+                "model": args.model,
+                "backend": args.backend,
+                "max_input_tokens": args.max_input_tokens,
+                "max_new_tokens": args.max_new_tokens,
+                "batch_size": args.batch_size,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+            },
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary_payload, f, ensure_ascii=False, indent=2)
+        print(f"[Write] summary json -> {summary_path}")
+
     # outputs
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    write_jsonl(args.output, kept)
-    print(f"[Write] filtered jsonl -> {args.output}")
+    write_json(args.output, kept)
+    print(f"[Write] filtered json -> {args.output}")
     if args.save_csv and logs:
         write_csv(args.save_csv, logs)
         print(f"[Write] decisions csv -> {args.save_csv}")
