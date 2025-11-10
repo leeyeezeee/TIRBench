@@ -624,6 +624,8 @@ def main():
     bs = max(1, args.batch_size)
     kept: List[Example] = []
     logs: List[Dict[str, Any]] = []
+    # 用于保存答案对比（仅 gsm8k 和 math）
+    answer_comparisons: List[Dict[str, Any]] = []
 
     t0 = time()
     for i in tqdm(range(0, len(examples), bs), ncols=100, desc="Filtering"):
@@ -645,6 +647,22 @@ def main():
                 hit, s1, s2 = match_extractive(pred, ex.answers, args.f1_threshold)
             else:
                 hit, s1, s2 = match_math(pred, ex.answers)
+
+            # 对于 gsm8k 和 math，保存答案对比
+            if args.dataset in ("gsm8k", "math"):
+                pred_extracted = _extract_answer_from_response(pred, args.dataset)
+                gold_extracted = ex.answers[0] if ex.answers else ""
+                answer_comparisons.append({
+                    "id": ex.id,
+                    "question": ex.question,
+                    "model_raw_output": pred,
+                    "model_extracted_answer": pred_extracted,
+                    "gold_raw_answer": gold_extracted,
+                    "gold_extracted_number": str(_num(gold_extracted)) if _num(gold_extracted) is not None else gold_extracted,
+                    "model_extracted_number": str(_num(pred_extracted)) if _num(pred_extracted) is not None else pred_extracted,
+                    "match": bool(hit),
+                    "match_score": float(s2)
+                })
 
             is_easy = bool(hit)  # hit = 小模型能答 → 过滤
             if not is_easy:
@@ -700,6 +718,15 @@ def main():
         p = Path(args.output).with_suffix(".squad.json")
         export_squad_like(str(p), kept)
         print(f"[Write] squad-like json -> {p}")
+    
+    # 输出答案对比 JSON（仅 gsm8k 和 math）
+    if args.dataset in ("gsm8k", "math") and answer_comparisons:
+        comparison_dir = Path("results") / "answer_comparisons"
+        comparison_dir.mkdir(parents=True, exist_ok=True)
+        comparison_path = comparison_dir / f"{args.dataset}_comparison.json"
+        with open(comparison_path, "w", encoding="utf-8") as f:
+            json.dump(answer_comparisons, f, ensure_ascii=False, indent=2)
+        print(f"[Write] answer comparison json -> {comparison_path}")
         
 def match_multiple_choice(pred: str, golds: List[str], options: List[str] = None) -> Tuple[bool, float, float]:
     """
