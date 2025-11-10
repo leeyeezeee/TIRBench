@@ -1,0 +1,16 @@
+{
+  "dataset": "math",
+  "total_examples": 500,
+  "easy_examples": 19,
+  "filtered_examples": 481,
+  "accuracy": 0.038,
+  "parameters": {
+    "model": "/root/autodl-tmp/models/Qwen_Qwen3-4B/",
+    "backend": "vllm",
+    "max_input_tokens": 2048,
+    "max_new_tokens": 64,
+    "batch_size": 8,
+    "temperature": 0.0,
+    "top_p": 1.0
+  }
+}
