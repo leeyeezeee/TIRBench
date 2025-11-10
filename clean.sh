@@ -11,7 +11,7 @@ python data_cleaning.py \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 8 \
   --output /root/autodl-tmp/data/aqua.json \
-  --tp 8
+  --tp 4
 
 # GSM8K
 python data_cleaning.py \
@@ -23,7 +23,7 @@ python data_cleaning.py \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 8 \
   --output /root/autodl-tmp/data/gsm8k.json \
-  --tp 8
+  --tp 4
 
 # MATH
 python data_cleaning.py \
@@ -33,6 +33,6 @@ python data_cleaning.py \
   --input datasets/MATH/test-00000-of-00001.parquet \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
-  --batch_size 4 \
+  --batch_size 8 \
   --output /root/autodl-tmp/data/math.json \
-  --tp 8
+  --tp 4
