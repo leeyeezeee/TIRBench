@@ -1,4 +1,4 @@
-MODEL_PATH=./Qwen3-VL-4B-Thinking
+MODEL_PATH=/root/autodl-tmp/models/Qwen_Qwen3-4B/
 TOKENIZER_PATH=$MODEL_PATH
 
 # AQuA
@@ -10,7 +10,7 @@ python data_cleaning.py \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 8 \
-  --output outputs/aqua.json \
+  --output /root/autodl-tmp/data/aqua.json \
   --tp 8
 
 # GSM8K
@@ -22,7 +22,7 @@ python data_cleaning.py \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 8 \
-  --output outputs/gsm8k.json \
+  --output /root/autodl-tmp/data/gsm8k.json \
   --tp 8
 
 # MATH
@@ -34,5 +34,5 @@ python data_cleaning.py \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 4 \
-  --output outputs/math.json \
+  --output /root/autodl-tmp/data/math.json \
   --tp 8
