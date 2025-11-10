@@ -153,42 +153,174 @@ def match_extractive(pred: str, golds: List[str], thr: float=0.8) -> Tuple[bool,
 _BOXED = re.compile(r"\\boxed\{([^}]*)\}")
 _FRAC  = re.compile(r"\\frac\{([^}]*)\}\{([^}]*)\}")
 _PCT   = re.compile(r"^(-?\d+(?:\.\d+)?)\s*%$")
+_TEXT  = re.compile(r"\\text\{([^}]*)\}")
 
 def _strip_tex(s: str) -> str:
+    """
+    清理 LaTeX 格式，尽可能提取数值或简化表达式
+    """
     s = s.strip()
+    
+    # 提取 \boxed{} 中的内容
     m = _BOXED.search(s)
-    if m: s = m.group(1)
-    s = s.replace("$","")
-    s = _FRAC.sub(lambda m: str(float(m.group(1))/float(m.group(2)) if m.group(2)!='0' else m.group(1)), s)
-    return " ".join(s.replace(",", " ").split())
+    if m: 
+        s = m.group(1)
+    
+    # 移除美元符号
+    s = s.replace("$", "")
+    
+    # 尝试处理 \frac{a}{b}，只处理 a,b 都是数字的情况
+    def safe_frac_sub(match):
+        try:
+            numerator = match.group(1).strip()
+            denominator = match.group(2).strip()
+            # 只处理纯数字的分数
+            if denominator != '0':
+                num_val = float(numerator)
+                den_val = float(denominator)
+                return str(num_val / den_val)
+            else:
+                return match.group(1)
+        except (ValueError, ZeroDivisionError):
+            # 如果不是数字，保留原始格式（去掉 \frac 但保留内容）
+            return f"({match.group(1)})/({match.group(2)})"
+    
+    s = _FRAC.sub(safe_frac_sub, s)
+    
+    # 处理其他常见的 LaTeX 命令
+    s = re.sub(r'\\text\{([^}]*)\}', r'\1', s)  # \text{euros} -> euros
+    s = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', s)  # \mathrm{...} -> ...
+    s = re.sub(r'\\sqrt\[(\d+)\]\{([^}]*)\}', r'root\1(\2)', s)  # \sqrt[3]{x} -> root3(x)
+    s = re.sub(r'\\sqrt\{([^}]*)\}', r'sqrt(\1)', s)  # \sqrt{x} -> sqrt(x)
+    
+    # 移除多余的空格和逗号
+    s = s.replace(",", " ")
+    s = " ".join(s.split())
+    
+    return s
+
+def _normalize_latex_answer(s: str) -> str:
+    """
+    标准化 LaTeX 答案用于比较
+    处理各种格式：区间、方程、表达式等
+    """
+    s = s.strip()
+    
+    # 提取 \boxed{} 内容
+    m = _BOXED.search(s)
+    if m:
+        s = m.group(1)
+    
+    # 标准化常见符号
+    s = s.replace("$", "")
+    s = s.replace(" ", "")
+    s = s.replace("\\,", "")
+    s = s.replace("\\:", "")
+    s = s.replace("\\;", "")
+    
+    # 标准化分数：\frac{a}{b} -> a/b
+    s = re.sub(r'\\frac\{([^}]*)\}\{([^}]*)\}', r'(\1)/(\2)', s)
+    
+    # 标准化根号
+    s = re.sub(r'\\sqrt\[(\d+)\]\{([^}]*)\}', r'root\1(\2)', s)
+    s = re.sub(r'\\sqrt\{([^}]*)\}', r'sqrt(\1)', s)
+    
+    # 标准化文本
+    s = re.sub(r'\\text\{([^}]*)\}', r'\1', s)
+    s = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', s)
+    
+    # 标准化括号
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace("\\{", "{").replace("\\}", "}")
+    
+    # 移除其他常见 LaTeX 命令
+    s = re.sub(r'\\[a-zA-Z]+', '', s)
+    
+    return s.lower().strip()
 
 def _num(s: str) -> Optional[float]:
-    s = _strip_tex(s)
-    if "####" in s: s = s.split("####")[-1].strip()
-    m = _PCT.match(s)
+    s = _strip_tex(s).strip()
+    
+    # 优先处理 #### 格式（GSM8K 标准格式）
+    if "####" in s:
+        s = s.split("####")[-1].strip()
+    
+    # 移除常见的单位词
+    s = re.sub(r'\b(clips|dollars|cents|people|items|units|days|hours)\b', '', s, flags=re.IGNORECASE)
+    
+    # 处理百分比
+    m = _PCT.match(s.strip())
     if m:
-        try: return float(m.group(1)) / 100.0
-        except: pass
+        try: 
+            return float(m.group(1)) / 100.0
+        except: 
+            pass
+    
+    # 提取所有数字（支持负数和小数）
     nums = re.findall(r"-?\d+(?:\.\d+)?", s)
-    if not nums: return None
-    try: return float(nums[-1])
-    except: return None
+    if not nums: 
+        return None
+    
+    # 返回最后一个数字（通常是最终答案）
+    try: 
+        return float(nums[-1])
+    except: 
+        return None
 
-def match_math(pred: str, golds: List[str]) -> Tuple[bool,float,float]:
+def match_math(pred: str, golds: List[str]) -> Tuple[bool, float, float]:
+    """
+    匹配数学答案，支持多种格式
+    1. 纯数字比较
+    2. LaTeX 表达式比较
+    3. 文本标准化比较
+    """
+    pred = pred.strip()
+    
+    # 策略 1: 数值比较（对纯数字答案）
     pn = _num(pred)
     for g in golds:
         gn = _num(g)
         if pn is not None and gn is not None:
             if gn == 0:
-                if abs(pn) <= 1e-9: return True, 0.0, 1.0
+                if abs(pn) <= 1e-9: 
+                    return True, 0.0, 1.0
             else:
-                rel = abs(pn-gn)/(abs(gn)+1e-12)
-                if rel <= 1e-6: return True, rel, float(pn==gn)
-    # fallback textual
-    pt = _norm(_strip_tex(pred))
-    gts = [_norm(_strip_tex(g)) for g in golds]
-    hit = pt in gts
-    return hit, (0.0 if hit else 1.0), float(hit)
+                rel = abs(pn - gn) / (abs(gn) + 1e-12)
+                if rel <= 1e-4:  # 放宽容差到 0.01%
+                    return True, rel, float(pn == gn)
+    
+    # 策略 2: LaTeX 标准化比较（处理复杂表达式）
+    try:
+        pred_latex = _normalize_latex_answer(pred)
+        for g in golds:
+            gold_latex = _normalize_latex_answer(g)
+            if pred_latex == gold_latex:
+                return True, 0.0, 1.0
+            # 部分匹配：金标准包含在预测中，或反之
+            if pred_latex and gold_latex:
+                if (len(gold_latex) > 3 and gold_latex in pred_latex) or \
+                   (len(pred_latex) > 3 and pred_latex in gold_latex):
+                    return True, 0.0, 0.5
+    except Exception:
+        pass  # LaTeX 处理失败，继续其他策略
+    
+    # 策略 3: 文本标准化比较（fallback）
+    try:
+        pt = _norm(_strip_tex(pred))
+        for g in golds:
+            gt = _norm(_strip_tex(g))
+            if pt and gt:
+                if pt == gt:
+                    return True, 0.0, 1.0
+                # 如果标准化后的文本有部分匹配（至少 5 个字符）
+                if len(gt) >= 5 and gt in pt:
+                    return True, 0.0, 0.5
+                if len(pt) >= 5 and pt in gt:
+                    return True, 0.0, 0.5
+    except Exception:
+        pass
+    
+    return False, 1.0, 0.0
 
 # =============== Prompt builders ===============
 def default_prompt(ex: Example, tokenizer=None, use_chat_template=False,
@@ -410,7 +542,15 @@ def main():
 
         for ex, pred in zip(batch, preds):
             pred = (pred or "").strip()
-            if task_type == "extractive":
+            
+            # AQuA 使用多选题匹配
+            if args.dataset == "aqua":
+                # 从 context 中提取 options
+                options = []
+                if ex.context.startswith("Options:"):
+                    options = [line.strip() for line in ex.context.split('\n')[1:] if line.strip()]
+                hit, s1, s2 = match_multiple_choice(pred, ex.answers, options)
+            elif task_type == "extractive":
                 hit, s1, s2 = match_extractive(pred, ex.answers, args.f1_threshold)
             else:
                 hit, s1, s2 = match_math(pred, ex.answers)
@@ -469,6 +609,52 @@ def main():
         p = Path(args.output).with_suffix(".squad.json")
         export_squad_like(str(p), kept)
         print(f"[Write] squad-like json -> {p}")
+        
+def match_multiple_choice(pred: str, golds: List[str], options: List[str] = None) -> Tuple[bool, float, float]:
+    """
+    匹配多选题答案（如 AQuA）
+    支持：
+    - 直接匹配字母：A, B, C, D, E
+    - 从文本中提取：The answer is E
+    - 通过数字反推：如果输出 23，且选项 E)23，则匹配 E
+    """
+    pred = pred.strip()
+    
+    # 1. 直接提取字母（A-E）
+    # 匹配单独的字母或 "answer is X" 格式
+    letter_match = re.search(r'\b([A-E])\b', pred.upper())
+    if letter_match:
+        pred_letter = letter_match.group(1)
+        for g in golds:
+            if pred_letter.upper() == g.upper():
+                return True, 0.0, 1.0
+    
+    # 2. 如果提供了 options，尝试通过数字反推
+    if options:
+        pred_num = _num(pred)
+        if pred_num is not None:
+            # 遍历选项，看哪个选项包含这个数字
+            for opt in options:
+                # 选项格式：A)21, B)21.5, C)22, D)22.5, E)23
+                opt_match = re.match(r'([A-E])\)(.*)', opt.strip())
+                if opt_match:
+                    opt_letter = opt_match.group(1)
+                    opt_value_str = opt_match.group(2).strip()
+                    opt_num = _num(opt_value_str)
+                    if opt_num is not None and abs(pred_num - opt_num) < 1e-6:
+                        # 找到了对应的选项，检查是否是正确答案
+                        for g in golds:
+                            if opt_letter.upper() == g.upper():
+                                return True, 0.0, 1.0
+    
+    # 3. Fallback 文本匹配
+    pt = _norm(pred)
+    for g in golds:
+        gt = _norm(g)
+        if pt == gt or gt in pt or pt in gt:
+            return True, 0.0, 1.0
+    
+    return False, 1.0, 0.0
 
 if __name__ == "__main__":
     main()

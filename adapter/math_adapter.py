@@ -56,18 +56,20 @@ def build_prompt(ex, tokenizer=None):
     MATH 包含竞赛级数学问题，答案可能包含 LaTeX 格式（如 \\boxed{}）
     """
     content = (
-        f"Solve this competition mathematics problem.\n\n"
         f"Problem: {ex.question}\n\n"
-        "Provide the final answer in its simplest form. "
-        "If the answer involves LaTeX notation like \\boxed{{}}, include it. "
-        "Otherwise, provide the numeric or algebraic answer directly.\n"
-        "Answer:"
+        "Solve this mathematics problem step by step.\n"
+        "Provide your final answer in one of these formats:\n"
+        "1. For numeric answers: Write the number directly (e.g., 42 or -3.14)\n"
+        "2. For LaTeX answers: Use \\boxed{{your answer}} (e.g., \\boxed{{\\frac{{-33}}{{2}}}})\n"
+        "3. For intervals: Use standard notation (e.g., [0,3) or (-\\infty, 5])\n"
+        "4. For equations: Write the final result (e.g., x = 5 or k = \\frac{{-33}}{{2}})\n\n"
+        "Final Answer:"
     )
     
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
             msgs = [
-                {"role": "system", "content": "You are an expert mathematics problem solver specializing in competition math."},
+                {"role": "system", "content": "You are an expert mathematics solver. Provide clear, precise answers using appropriate mathematical notation."},
                 {"role": "user", "content": content}
             ]
             return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)

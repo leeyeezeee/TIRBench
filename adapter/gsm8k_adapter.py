@@ -76,16 +76,18 @@ def build_prompt(ex, tokenizer=None):
     GSM8K 包含小学阶段的多步骤应用题，需要清晰的数值答案
     """
     content = (
-        f"Solve this math word problem step by step.\n\n"
         f"Problem: {ex.question}\n\n"
-        "Provide only the final numeric answer (no units, no explanation).\n"
+        "Solve this problem and provide your answer in the following format:\n"
+        "#### [your numeric answer]\n"
+        "For example, if the answer is 42, write: #### 42\n"
+        "Do not include units or additional text after the number.\n"
         "Answer:"
     )
     
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
             msgs = [
-                {"role": "system", "content": "You are a helpful math tutor solving grade school word problems."},
+                {"role": "system", "content": "You are a helpful math tutor. Always provide your final answer in the format '#### [number]'."},
                 {"role": "user", "content": content}
             ]
             return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)

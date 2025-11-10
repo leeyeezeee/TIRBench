@@ -63,14 +63,16 @@ def build_prompt(ex, tokenizer=None):
     content = (
         f"{ex.question}\n\n"
         f"{ex.context}\n\n"
-        "Please select the correct option letter (A, B, C, D, or E) as your answer.\n"
-        "Respond with only the letter of the correct answer."
+        "Please analyze the problem and select the correct option.\n"
+        "Respond in the format: Answer: [letter]\n"
+        "For example: Answer: E\n"
+        "Provide ONLY the letter (A, B, C, D, or E), nothing else."
     )
     
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
             msgs = [
-                {"role": "system", "content": "You are a precise math problem solver. Always respond with only the option letter."},
+                {"role": "system", "content": "You are a precise math problem solver. Always respond with ONLY the option letter (A, B, C, D, or E). Do not include numbers or explanations."},
                 {"role": "user", "content": content}
             ]
             return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
