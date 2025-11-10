@@ -267,16 +267,48 @@ def _num(s: str) -> Optional[float]:
     except: 
         return None
 
-def match_math(pred: str, golds: List[str]) -> Tuple[bool, float, float]:
+def _extract_answer_from_response(s: str, dataset: str) -> str:
+    """
+    从模型响应中提取答案，根据数据集类型使用不同策略
+    """
+    s = s.strip()
+    
+    if dataset == "gsm8k":
+        # GSM8K: 优先提取 #### 后的内容
+        if "####" in s:
+            return s.split("####")[-1].strip()
+        # 如果没有 ####，提取最后一个数字
+        nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+        if nums:
+            return nums[-1]
+        return s
+    
+    elif dataset == "math":
+        # MATH: 优先提取 \boxed{} 中的内容
+        m = _BOXED.search(s)
+        if m:
+            return m.group(1).strip()
+        # 如果没有 \boxed{}，返回原文
+        return s
+    
+    else:
+        # 其他数据集，返回原文
+        return s
+
+def match_math(pred: str, golds: List[str], dataset: str = None) -> Tuple[bool, float, float]:
     """
     匹配数学答案，支持多种格式
-    1. 纯数字比较
-    2. LaTeX 表达式比较
-    3. 文本标准化比较
+    1. 纯数字比较（GSM8K 主要用）
+    2. LaTeX 表达式比较（MATH 主要用）
+    3. 文本标准化比较（通用 fallback）
     """
     pred = pred.strip()
     
-    # 策略 1: 数值比较（对纯数字答案）
+    # 根据数据集提取答案
+    if dataset:
+        pred = _extract_answer_from_response(pred, dataset)
+    
+    # 策略 1: 数值比较（对纯数字答案，主要用于 GSM8K）
     pn = _num(pred)
     for g in golds:
         gn = _num(g)
@@ -286,38 +318,49 @@ def match_math(pred: str, golds: List[str]) -> Tuple[bool, float, float]:
                     return True, 0.0, 1.0
             else:
                 rel = abs(pn - gn) / (abs(gn) + 1e-12)
-                if rel <= 1e-4:  # 放宽容差到 0.01%
-                    return True, rel, float(pn == gn)
+                if rel <= 1e-4:  # 0.01% 容差
+                    return True, rel, float(abs(pn - gn) < 1e-9)
     
-    # 策略 2: LaTeX 标准化比较（处理复杂表达式）
+    # 策略 2: LaTeX 标准化比较（处理复杂表达式，主要用于 MATH）
     try:
         pred_latex = _normalize_latex_answer(pred)
         for g in golds:
             gold_latex = _normalize_latex_answer(g)
-            if pred_latex == gold_latex:
-                return True, 0.0, 1.0
-            # 部分匹配：金标准包含在预测中，或反之
             if pred_latex and gold_latex:
-                if (len(gold_latex) > 3 and gold_latex in pred_latex) or \
-                   (len(pred_latex) > 3 and pred_latex in gold_latex):
-                    return True, 0.0, 0.5
-    except Exception:
+                # 完全匹配
+                if pred_latex == gold_latex:
+                    return True, 0.0, 1.0
+                # 部分匹配（容错）
+                if len(gold_latex) >= 3:
+                    if gold_latex in pred_latex:
+                        return True, 0.0, 0.8
+    except Exception as e:
         pass  # LaTeX 处理失败，继续其他策略
     
-    # 策略 3: 文本标准化比较（fallback）
+    # 策略 3: 文本标准化比较（fallback，处理坐标对、区间等）
     try:
+        # 先尝试直接比较（处理坐标对、区间等）
+        pred_clean = pred.strip().replace(" ", "")
+        for g in golds:
+            gold_clean = g.strip().replace(" ", "")
+            # 完全匹配
+            if pred_clean.lower() == gold_clean.lower():
+                return True, 0.0, 1.0
+            # 坐标对、区间的变体匹配：(3,-1) vs (3, -1)
+            if pred_clean.replace(",", ", ") == gold_clean.replace(",", ", "):
+                return True, 0.0, 1.0
+        
+        # 标准化文本比较
         pt = _norm(_strip_tex(pred))
         for g in golds:
             gt = _norm(_strip_tex(g))
             if pt and gt:
                 if pt == gt:
                     return True, 0.0, 1.0
-                # 如果标准化后的文本有部分匹配（至少 5 个字符）
-                if len(gt) >= 5 and gt in pt:
-                    return True, 0.0, 0.5
-                if len(pt) >= 5 and pt in gt:
-                    return True, 0.0, 0.5
-    except Exception:
+                # 部分匹配（至少 4 个字符）
+                if len(gt) >= 4 and gt in pt:
+                    return True, 0.0, 0.6
+    except Exception as e:
         pass
     
     return False, 1.0, 0.0

@@ -77,17 +77,19 @@ def build_prompt(ex, tokenizer=None):
     """
     content = (
         f"Problem: {ex.question}\n\n"
-        "Solve this problem and provide your answer in the following format:\n"
-        "#### [your numeric answer]\n"
-        "For example, if the answer is 42, write: #### 42\n"
-        "Do not include units or additional text after the number.\n"
-        "Answer:"
+        "Solve this math problem step by step, then provide your final answer.\n"
+        "Format your final answer as: #### [number]\n"
+        "For example:\n"
+        "Step 1: Calculate 48/2 = 24\n"
+        "Step 2: Calculate 48 + 24 = 72\n"
+        "#### 72\n\n"
+        "Your solution:"
     )
     
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
             msgs = [
-                {"role": "system", "content": "You are a helpful math tutor. Always provide your final answer in the format '#### [number]'."},
+                {"role": "system", "content": "You are a helpful math tutor. Always end your answer with '#### [number]' where [number] is the final numeric answer."},
                 {"role": "user", "content": content}
             ]
             return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)

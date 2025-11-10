@@ -57,19 +57,20 @@ def build_prompt(ex, tokenizer=None):
     """
     content = (
         f"Problem: {ex.question}\n\n"
-        "Solve this mathematics problem step by step.\n"
-        "Provide your final answer in one of these formats:\n"
-        "1. For numeric answers: Write the number directly (e.g., 42 or -3.14)\n"
-        "2. For LaTeX answers: Use \\boxed{{your answer}} (e.g., \\boxed{{\\frac{{-33}}{{2}}}})\n"
-        "3. For intervals: Use standard notation (e.g., [0,3) or (-\\infty, 5])\n"
-        "4. For equations: Write the final result (e.g., x = 5 or k = \\frac{{-33}}{{2}})\n\n"
-        "Final Answer:"
+        "Solve this competition mathematics problem.\n"
+        "Provide your final answer using \\boxed{{}} notation.\n"
+        "Examples:\n"
+        "- For a number: \\boxed{{42}}\n"
+        "- For a coordinate: \\boxed{{(3, -1)}}\n"
+        "- For an expression: \\boxed{{\\frac{{-33}}{{2}}}}\n"
+        "- For an interval: \\boxed{{[0, 3)}}\n\n"
+        "Your solution:"
     )
     
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
             msgs = [
-                {"role": "system", "content": "You are an expert mathematics solver. Provide clear, precise answers using appropriate mathematical notation."},
+                {"role": "system", "content": "You are an expert mathematics solver. Always provide your final answer in \\boxed{{}} format."},
                 {"role": "user", "content": content}
             ]
             return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
