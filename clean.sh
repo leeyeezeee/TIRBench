@@ -6,7 +6,7 @@ python data_cleaning.py \
   --backend vllm \
   --dataset aqua \
   --source json \
-  --input datasets/AQuA/validation-00000-of-00001.parquet \
+  --input datasets/AQuA/test-00000-of-00001.parquet \
   --model $MODEL_PATH \
   --tokenizer_path $TOKENIZER_PATH \
   --batch_size 8 \
