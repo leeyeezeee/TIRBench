@@ -63,7 +63,7 @@ def build_args():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--store_think", action="store_true",
                 help="Store raw model output ('think' text) for later analysis.")
-    ap.add_argument("--store_prompt", action="store_true",                            
+    ap.add_argument("--store_prompt", action="store_true",
                     help="Also store the exact prompt that was sent to the model.")
     ap.add_argument("--store_context", type=int, default=0,
                     help="If >0, store the first N chars of context in logs.")
