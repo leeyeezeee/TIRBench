@@ -1,0 +1,30 @@
+name: "OMINI"
+key: "omini"
+category: "other"
+task_type: "other"
+
+default_source: "json"
+default_input: null
+
+adapter: "dataformat.adapters.omini_adapter"
+
+prompt:
+  use_chat_template: true
+  system: "You are an expert problem solver. Analyze the problem carefully and provide a clear solution."
+  user_template: |
+    Problem: {question}
+
+    Solve this competition mathematics problem.
+    Provide your final answer using \\boxed{{}} notation.
+    Examples:
+    - For a number: \\boxed{{42}}
+    - For a coordinate: \\boxed{{(3, -1)}}
+    - For an expression: \\boxed{{\\frac{{-33}}{{2}}}}
+    - For an interval: \\boxed{{[0, 3)}}
+
+    Your solution:
+
+filter:
+  rule: "auto"
+
+

@@ -1,0 +1,27 @@
+name: "Natural Questions"
+key: "nq"
+category: "commonsense"
+task_type: "extractive"
+
+default_source: "hf"
+default_input: null
+
+adapter: "dataformat.adapters.nq_adapter"
+
+prompt:
+  use_chat_template: true
+  system: "You are a precise open-domain extractive QA assistant."
+  user_template: |
+    Read the context and answer with an exact span from the context. If it cannot be answered from the context, reply exactly with: unanswerable.
+
+    Context:
+    {context}
+
+    Question: {question}
+    Answer:
+
+filter:
+  rule: "nq"
+  f1_threshold: 0.8
+
+

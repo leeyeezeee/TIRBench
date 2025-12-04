@@ -1,0 +1,28 @@
+name: "AQuA-RAT"
+key: "aqua"
+category: "math"
+task_type: "math"
+
+default_source: "json"
+default_input: "datasets/AQuA/validation-00000-of-00001.parquet"
+
+adapter: "dataformat.adapters.aqua_adapter"
+
+prompt:
+  use_chat_template: true
+  system: "You are a precise math problem solver. Always respond with ONLY the option letter (A, B, C, D, or E). Do not include numbers or explanations."
+  user_template: |
+    {question}
+
+    {context}
+
+    Please analyze the problem and select the correct option.
+    Respond in the format: Answer: [letter]
+    For example: Answer: E
+    Provide ONLY the letter (A, B, C, D, or E), nothing else.
+
+filter:
+  rule: "mcq"
+  relative_tolerance: 1e-6
+
+

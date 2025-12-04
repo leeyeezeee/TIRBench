@@ -1,0 +1,28 @@
+name: "SQuAD v2.0"
+key: "squadv2"
+category: "commonsense"
+task_type: "extractive"
+
+default_source: "json"
+default_input: "datasets/SQuAD/dev-v2.0.json"
+
+adapter: "dataformat.adapters.squadv2_adapter"
+
+prompt:
+  use_chat_template: true
+  system: "You are a precise extractive QA assistant."
+  user_template: |
+    Read the context and answer with an exact span from the context.
+    If the question cannot be answered using only the given context, reply exactly with: unanswerable.
+
+    Context:
+    {context}
+
+    Question: {question}
+    Answer:
+
+filter:
+  rule: "squad_v2"
+  f1_threshold: 0.8
+
+

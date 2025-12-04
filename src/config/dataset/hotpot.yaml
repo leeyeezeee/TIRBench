@@ -1,0 +1,27 @@
+name: "HotpotQA"
+key: "hotpot"
+category: "commonsense"
+task_type: "extractive"
+
+default_source: "json"
+default_input: "datasets/HotpotQA/hotpot_dev_distractor_v1.json"
+
+adapter: "dataformat.adapters.hotpot_adapter"
+
+prompt:
+  use_chat_template: true
+  system: "You are a careful multi-hop reading comprehension assistant."
+  user_template: |
+    Answer the multi-hop question using ONLY the given context. Return an exact phrase from the context. If it cannot be answered from the context, reply exactly with: unanswerable.
+
+    Context:
+    {context}
+
+    Question: {question}
+    Answer:
+
+filter:
+  rule: "hotpot"
+  f1_threshold: 0.8
+
+

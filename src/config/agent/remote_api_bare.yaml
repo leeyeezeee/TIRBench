@@ -1,0 +1,23 @@
+# Remote API Backend (No Tools)
+# Example configuration for OpenAI/Anthropic API without tool calling
+
+backend: "remote_api"
+
+remote_model: "gpt-4o"  # or "claude-3.5-sonnet"
+
+generation:
+  temperature: 0.7
+  top_p: 1.0
+  max_tokens: 2048
+  max_new_tokens: 2048
+
+tools:
+  enabled: false
+  available: []
+
+tool_calling:
+  format: "json"
+  max_iterations: 0
+
+system_prompt: null
+

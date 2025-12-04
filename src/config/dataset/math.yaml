@@ -1,0 +1,31 @@
+name: "MATH"
+key: "math"
+category: "math"
+task_type: "math"
+
+default_source: "json"
+default_input: "datasets/MATH/test-00000-of-00001.parquet"
+
+adapter: "dataformat.adapters.math_adapter"
+
+prompt:
+  use_chat_template: true
+  system: "You are an expert mathematics solver. Always provide your final answer in \\boxed{{}} format."
+  user_template: |
+    Problem: {question}
+
+    Solve this competition mathematics problem.
+    Provide your final answer using \\boxed{{}} notation.
+    Examples:
+    - For a number: \\boxed{{42}}
+    - For a coordinate: \\boxed{{(3, -1)}}
+    - For an expression: \\boxed{{\\frac{{-33}}{{2}}}}
+    - For an interval: \\boxed{{[0, 3)}}
+
+    Your solution:
+
+filter:
+  rule: "math_numeric"
+  relative_tolerance: 1e-6
+
+
