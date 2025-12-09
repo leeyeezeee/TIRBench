@@ -2,53 +2,32 @@
 # -*- coding: utf-8 -*-
 
 """
-Multi-backend (vLLM / SGLang / Transformers) data cleaning:
-- Filter out "easy" samples that a small model can already solve.
-- Default backend: vLLM (Ascend: use vLLM-Ascend).
-- Dataset adapters live in adapter/*.py (must implement load(args)->List[Example]).
-- Supports extractive QA (SQuADv2/Hotpot/NQ) and math QA (AQuA/GSM8K/MATH).
-
-Outputs:
-  - --output <*.json>: filtered examples (single JSON array; same schema).
-  - --save_csv <*.csv>: decision log (optional).
-  - --export_squad_like: extra SQuAD-like JSON (extractive only).
-
-Usage (Ascend 910B, vLLM-Ascend, 4 cards):
-  export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-  python data_cleaning.py \
-      --backend vllm --tp 4 \
-      --dataset squadv2 --source json --input datasets/SQuAD/dev-v2.0.json \
-      --model /data/models/Qwen2.5-0.5B-Instruct \
-      --tokenizer_path /data/models/Qwen2.5-0.5B-Instruct \
-      --use_chat_template --include_unanswerable_hint --handle_unanswerable \
-      --temperature 0.0 --batch_size 8 \
-      --output squadv2.filtered.jsonl --save_csv squadv2.decisions.csv
+Experiment execution logic for data cleaning.
+This module contains all the core logic for running data cleaning experiments.
 """
 
 from __future__ import annotations
-import argparse, json, os, re, importlib, math, random, sys
-from dataclasses import dataclass, asdict, field
-from typing import List, Tuple, Iterable, Dict, Any, Optional, Callable
+import json
+import os
+import re
+import random
+import sys
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Any, Optional
 from collections import Counter
 from time import time
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 import numpy as np
-import yaml
-
-# Sacred for experiment management
-from sacred import Experiment
-from sacred.observers import FileStorageObserver
 
 # Import configuration loaders
 sys.path.insert(0, str(Path(__file__).parent))
 from dataformator.dataset_loader import DatasetLoader
 try:
-    from modelloader.llm_agent import LLMAgent, load_agent_config
+    from modelloader.llm_agent import LLMAgent
 except ImportError:
     LLMAgent = None
-    load_agent_config = None
 
 # =============== Example schema ===============
 @dataclass
@@ -71,200 +50,26 @@ class ConfigObject:
         # Return None for missing attributes to maintain compatibility
         return None
 
-# =============== Configuration Loading ===============
-def load_config_from_yaml(config_path: Optional[str]) -> Dict[str, Any]:
-    """Load configuration from YAML file"""
-    if config_path and Path(config_path).exists():
-        with open(config_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f) or {}
-    return {}
-
-def merge_configs(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """Deep merge two configuration dictionaries"""
-    result = base.copy()
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = merge_configs(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-def load_configs(dataset_key: str, agent_config_path: Optional[str] = None) -> Dict[str, Any]:
+# =============== Configuration Initialization ===============
+def init_config_from_sacred(sacred_config: Dict[str, Any]) -> ConfigObject:
     """
-    Load configurations from YAML files:
-    1. Load dataset config from config/dataset/{dataset_key}.yaml
-    2. Load agent config from config/agent/{agent_config_path} or default.yaml
+    Initialize configuration from Sacred config.
+    The config has already been merged with YAML files in main.py.
     """
-    config = {}
+    # Start with Sacred config values
+    config_dict = dict(sacred_config)
     
-    # Load dataset config
-    dataset_config_path = Path(__file__).parent.parent / "config" / "dataset" / f"{dataset_key}.yaml"
-    if dataset_config_path.exists():
-        dataset_config = load_config_from_yaml(str(dataset_config_path))
-        config["dataset"] = dataset_config
+    # Merge dataset config if present
+    dataset_config = sacred_config.get("dataset_config", {})
+    if dataset_config:
+        if dataset_config.get("default_source"):
+            config_dict["source"] = dataset_config["default_source"]
+        if dataset_config.get("default_input"):
+            config_dict["input"] = os.path.expandvars(dataset_config["default_input"])
     
-    # Load agent config
-    if agent_config_path:
-        agent_config_file = Path(agent_config_path)
-        if not agent_config_file.is_absolute():
-            agent_config_file = Path(__file__).parent.parent / "config" / "agent" / agent_config_path
-    else:
-        agent_config_file = Path(__file__).parent.parent / "config" / "agent" / "default.yaml"
-    
-    if agent_config_file.exists():
-        agent_config = load_config_from_yaml(str(agent_config_file))
-        config["agent"] = agent_config
-    
-    return config
-
-# =============== Sacred Experiment Setup ===============
-ex = Experiment("data_cleaning")
-
-@ex.config
-def default_config():
-    """Default configuration for Sacred experiment"""
-    # Dataset configuration
-    dataset = "gsm8k"
-    source = "json"
-    input_path = None
-    split = "validation"
-    sample_size = 500
-    max_eval_examples = 0
-    seed = 42
-    store_think = False
-    store_prompt = False
-    store_context = 0
-    run_tag = ""
-    decision = "auto"
-    squad_f1_threshold = 0.8
-    hotpot_f1_threshold = 0.8
-    nq_f1_threshold = 0.8
-    results_dir = "results"
-    save_original = False
-    
-    # Backend configuration (will be merged with agent config)
-    backend = "vllm"
-    model = ""
-    tokenizer_path = None
-    local_files_only = False
-    use_chat_template = False
-    temperature = 0.0
-    top_p = 1.0
-    max_input_tokens = 2048
-    max_new_tokens = 64
-    
-    # vLLM
-    tp = 1
-    gpu_memory_utilization = 0.9
-    
-    # SGLang
-    sglang_api_base = os.getenv("SGLANG_API_BASE", "http://127.0.0.1:30000")
-    sglang_api_key = os.getenv("SGLANG_API_KEY", None)
-    sglang_model = None
-    concurrency = 8
-    
-    # Transformers
-    device = "cuda"
-    device_map = None
-    
-    # Filtering & outputs
-    batch_size = 8
-    f1_threshold = 0.8
-    export_squad_like = False
-    output = ""
-    save_csv = None
-    no_logs = False
-    eval_only = False
-    
-    # Dataset hints
-    include_unanswerable_hint = False
-    handle_unanswerable = False
-    hotpot_config = "distractor"
-    
-    # Config file paths
-    agent_config_file = None  # Path to agent config YAML (relative to config/agent/)
-    use_agent_tools = False  # Whether to use LLMAgent with tools
-
-# =============== Adapters ===============
-ADAPTER_REG = {
-    "squadv2": "adapter.squadv2_adapter",
-    "hotpot":  "adapter.hotpot_adapter",
-    "nq":      "adapter.nq_adapter",
-    "aqua":    "adapter.aqua_adapter",
-    "gsm8k":   "adapter.gsm8k_adapter",
-    "math":    "adapter.math_adapter",
-    "omini":   "adapter.omini_adapter",
-}
-
-def init_config_from_sacred_and_yaml(sacred_config: Dict[str, Any]) -> ConfigObject:
-    """
-    Initialize configuration from Sacred config and YAML files.
-    Merges YAML configs (dataset and agent) with Sacred config (command line overrides).
-    """
-    dataset_key = sacred_config.get("dataset", "gsm8k")
-    
-    # Load YAML configs
-    yaml_configs = load_configs(dataset_key, sacred_config.get("agent_config_file"))
-    
-    # Start with default values
-    config_dict = {
-        "dataset": dataset_key,
-        "source": "json",
-        "input": None,
-        "split": "validation",
-        "sample_size": 500,
-        "max_eval_examples": 0,
-        "seed": 42,
-        "store_think": False,
-        "store_prompt": False,
-        "store_context": 0,
-        "run_tag": "",
-        "decision": "auto",
-        "squad_f1_threshold": 0.8,
-        "hotpot_f1_threshold": 0.8,
-        "nq_f1_threshold": 0.8,
-        "results_dir": "results",
-        "save_original": False,
-        "backend": "vllm",
-        "model": "",
-        "tokenizer_path": None,
-        "local_files_only": False,
-        "use_chat_template": False,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "max_input_tokens": 2048,
-        "max_new_tokens": 64,
-        "tp": 1,
-        "gpu_memory_utilization": 0.9,
-        "sglang_api_base": os.getenv("SGLANG_API_BASE", "http://127.0.0.1:30000"),
-        "sglang_api_key": os.getenv("SGLANG_API_KEY", None),
-        "sglang_model": None,
-        "concurrency": 8,
-        "device": "cuda",
-        "device_map": None,
-        "batch_size": 8,
-        "f1_threshold": 0.8,
-        "export_squad_like": False,
-        "output": "",
-        "save_csv": None,
-        "no_logs": False,
-        "eval_only": False,
-        "include_unanswerable_hint": False,
-        "handle_unanswerable": False,
-        "hotpot_config": "distractor",
-    }
-    
-    # Merge dataset config from YAML
-    if "dataset" in yaml_configs:
-        ds_config = yaml_configs["dataset"]
-        if ds_config.get("default_source"):
-            config_dict["source"] = ds_config["default_source"]
-        if ds_config.get("default_input"):
-            config_dict["input"] = os.path.expandvars(ds_config["default_input"])
-    
-    # Merge agent config from YAML
-    if "agent" in yaml_configs:
-        agent_config = yaml_configs["agent"]
+    # Merge agent config if present
+    agent_config = sacred_config.get("agent_config", {})
+    if agent_config:
         if agent_config.get("backend"):
             config_dict["backend"] = agent_config["backend"]
         if agent_config.get("model_path"):
@@ -292,29 +97,11 @@ def init_config_from_sacred_and_yaml(sacred_config: Dict[str, Any]) -> ConfigObj
             if "gpu_memory_utilization" in vllm_config:
                 config_dict["gpu_memory_utilization"] = vllm_config["gpu_memory_utilization"]
     
-    # Override with Sacred config (command line arguments take precedence)
-    for key, value in sacred_config.items():
-        if value is not None and key not in ["agent_config_file", "use_agent_tools"]:
-            config_dict[key] = value
-    
     # Handle input_path vs input
-    if "input_path" in sacred_config and sacred_config["input_path"]:
-        config_dict["input"] = sacred_config["input_path"]
+    if "input_path" in config_dict and config_dict["input_path"]:
+        config_dict["input"] = config_dict["input_path"]
     
     return ConfigObject(**config_dict)
-
-def load_by_adapter(args) -> Tuple[List[Example], Any]:
-    mod = importlib.import_module(ADAPTER_REG[args.dataset])
-    if not hasattr(mod, "load"):
-        raise AttributeError(f"{ADAPTER_REG[args.dataset]} must implement load(args)->List[Example]")
-    raw = mod.load(args)
-    exs: List[Example] = []
-    for x in raw:
-        if isinstance(x, Example):
-            exs.append(x)
-        else:
-            raise TypeError("Adapter.load must return Example or dict.")
-    return exs, mod
 
 # =============== Extractive metrics (EM/F1) ===============
 _ART = re.compile(r"\b(a|an|the)\b", re.UNICODE)
@@ -346,11 +133,7 @@ _UNANS = {
 }
 
 def _is_unanswerable_pred(pred: str) -> bool:
-    """
-    判断模型输出是否等价于“不可回答”
-    - 既支持直接输出 "unanswerable"
-    - 也支持句子里包含 unanswerable / no answer 等词
-    """
+    """判断模型输出是否等价于"不可回答" """
     t = _norm(pred)
     if t in _UNANS:
         return True
@@ -369,10 +152,7 @@ _ANSWER_LINE_RE = re.compile(
 )
 
 def extract_qa_answer(s: str) -> str:
-    """
-    从模型自由生成的文本里抽出一个短答案，用于 SQuAD / Hotpot / NQ 的 F1/EM 打分。
-    不影响数学三个数据集。
-    """
+    """从模型自由生成的文本里抽出一个短答案，用于 SQuAD / Hotpot / NQ 的 F1/EM 打分。"""
     if not s:
         return ""
     # 去掉 <think>...</think>
@@ -394,7 +174,7 @@ def extract_qa_answer(s: str) -> str:
     # 去掉收尾标点
     ans = ans.strip().strip(" .\"'")
 
-    # 3) 把各种“不知道/不可回答”的说法统一成 "unanswerable"
+    # 3) 把各种"不知道/不可回答"的说法统一成 "unanswerable"
     low = ans.lower()
     for u in _UNANS:
         if not u:
@@ -454,9 +234,7 @@ _PCT   = re.compile(r"^(-?\d+(?:\.\d+)?)\s*%$")
 _TEXT  = re.compile(r"\\text\{([^}]*)\}")
 
 def _strip_tex(s: str) -> str:
-    """
-    清理 LaTeX 格式，尽可能提取数值或简化表达式
-    """
+    """清理 LaTeX 格式，尽可能提取数值或简化表达式"""
     s = s.strip()
     
     # 提取 \boxed{} 中的内容
@@ -472,7 +250,6 @@ def _strip_tex(s: str) -> str:
         try:
             numerator = match.group(1).strip()
             denominator = match.group(2).strip()
-            # 只处理纯数字的分数
             if denominator != '0':
                 num_val = float(numerator)
                 den_val = float(denominator)
@@ -480,16 +257,15 @@ def _strip_tex(s: str) -> str:
             else:
                 return match.group(1)
         except (ValueError, ZeroDivisionError):
-            # 如果不是数字，保留原始格式（去掉 \frac 但保留内容）
             return f"({match.group(1)})/({match.group(2)})"
     
     s = _FRAC.sub(safe_frac_sub, s)
     
     # 处理其他常见的 LaTeX 命令
-    s = re.sub(r'\\text\{([^}]*)\}', r'\1', s)  # \text{euros} -> euros
-    s = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', s)  # \mathrm{...} -> ...
-    s = re.sub(r'\\sqrt\[(\d+)\]\{([^}]*)\}', r'root\1(\2)', s)  # \sqrt[3]{x} -> root3(x)
-    s = re.sub(r'\\sqrt\{([^}]*)\}', r'sqrt(\1)', s)  # \sqrt{x} -> sqrt(x)
+    s = re.sub(r'\\text\{([^}]*)\}', r'\1', s)
+    s = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', s)
+    s = re.sub(r'\\sqrt\[(\d+)\]\{([^}]*)\}', r'root\1(\2)', s)
+    s = re.sub(r'\\sqrt\{([^}]*)\}', r'sqrt(\1)', s)
     
     # 移除多余的空格和逗号
     s = s.replace(",", " ")
@@ -498,10 +274,7 @@ def _strip_tex(s: str) -> str:
     return s
 
 def _normalize_latex_answer(s: str) -> str:
-    """
-    标准化 LaTeX 答案用于比较
-    处理各种格式：区间、方程、表达式等
-    """
+    """标准化 LaTeX 答案用于比较"""
     s = s.strip()
     
     # 提取 \boxed{} 内容
@@ -537,10 +310,7 @@ def _normalize_latex_answer(s: str) -> str:
     return s.lower().strip()
 
 def _num(s: str) -> Optional[float]:
-    """
-    从字符串中提取数值
-    注意：对于 GSM8K 等简单数字，不应该过度处理
-    """
+    """从字符串中提取数值"""
     if not s:
         return None
     
@@ -582,9 +352,7 @@ def _num(s: str) -> Optional[float]:
         return None
 
 def _extract_answer_from_response(s: str, dataset: str) -> str:
-    """
-    从模型响应中提取答案，根据数据集类型使用不同策略
-    """
+    """从模型响应中提取答案，根据数据集类型使用不同策略"""
     if not s:
         return ""
     
@@ -594,16 +362,13 @@ def _extract_answer_from_response(s: str, dataset: str) -> str:
         # GSM8K: 严格提取 #### 后的内容
         if "####" in s:
             ans = s.split("####")[-1].strip()
-            # 移除可能的单位词
             ans = re.sub(r'\b(clips|dollars|cents|people|items|units|days|hours)\b', '', ans, flags=re.IGNORECASE)
             ans = ans.strip()
-            # 提取数字部分
             nums = re.findall(r"-?\d+(?:\.\d+)?", ans)
             if nums:
-                return nums[0]  # 返回第一个数字
+                return nums[0]
             return ans
         else:
-            # 如果没有 ####，尝试从最后一行提取
             lines = s.strip().split('\n')
             for line in reversed(lines):
                 nums = re.findall(r"-?\d+(?:\.\d+)?", line)
@@ -611,24 +376,18 @@ def _extract_answer_from_response(s: str, dataset: str) -> str:
                     return nums[-1]
             return s
     
-    elif dataset in  ["math","omini"]:
+    elif dataset in ["math","omini"]:
         # MATH: 优先提取 \boxed{} 中的内容
         m = _BOXED.search(s)
         if m:
             return m.group(1).strip()
-        # 如果没有 \boxed{}，返回原文
         return s
     
     else:
-        # 其他数据集，返回原文
         return s
 
 def match_math(pred: str, golds: List[str], dataset: str = None) -> Tuple[bool, float, float]:
-    """
-    匹配数学答案
-    - GSM8K: 纯数字比较
-    - MATH: LaTeX + 文本比较
-    """
+    """匹配数学答案"""
     if not pred or not golds:
         return False, 1.0, 0.0
     
@@ -644,22 +403,19 @@ def match_math(pred: str, golds: List[str], dataset: str = None) -> Tuple[bool, 
     if dataset == "gsm8k":
         pred_num = _num(pred_extracted)
         if pred_num is None:
-            # 如果提取失败，尝试从原始预测中提取
             pred_num = _num(pred)
         
         for g in golds:
             gold_num = _num(g)
             if pred_num is not None and gold_num is not None:
-                # 数值比较（允许小误差）
                 if abs(pred_num - gold_num) < 1e-6:
                     return True, 0.0, 1.0
         
-        # GSM8K 失败就是失败，不需要其他策略
         return False, 1.0, 0.0
     
     # ============ MATH 专用逻辑：多策略比较 ============
     if dataset in ["math","omini"]:
-        # 策略 1: 数值比较（如果答案是纯数字）
+        # 策略 1: 数值比较
         pred_num = _num(pred_extracted)
         for g in golds:
             gold_num = _num(g)
@@ -682,7 +438,7 @@ def match_math(pred: str, golds: List[str], dataset: str = None) -> Tuple[bool, 
         except:
             pass
         
-        # 策略 3: 直接文本比较（坐标、区间等）
+        # 策略 3: 直接文本比较
         pred_clean = pred_extracted.strip().replace(" ", "").lower()
         for g in golds:
             gold_clean = g.strip().replace(" ", "").lower()
@@ -708,6 +464,42 @@ def match_math(pred: str, golds: List[str], dataset: str = None) -> Tuple[bool, 
         if pred_num is not None and gold_num is not None:
             if abs(pred_num - gold_num) < 1e-6:
                 return True, 0.0, 1.0
+    
+    return False, 1.0, 0.0
+
+def match_multiple_choice(pred: str, golds: List[str], options: List[str] = None) -> Tuple[bool, float, float]:
+    """匹配多选题答案（如 AQuA）"""
+    pred = pred.strip()
+    
+    # 1. 直接提取字母（A-E）
+    letter_match = re.search(r'\b([A-E])\b', pred.upper())
+    if letter_match:
+        pred_letter = letter_match.group(1)
+        for g in golds:
+            if pred_letter.upper() == g.upper():
+                return True, 0.0, 1.0
+    
+    # 2. 如果提供了 options，尝试通过数字反推
+    if options:
+        pred_num = _num(pred)
+        if pred_num is not None:
+            for opt in options:
+                opt_match = re.match(r'([A-E])\)(.*)', opt.strip())
+                if opt_match:
+                    opt_letter = opt_match.group(1)
+                    opt_value_str = opt_match.group(2).strip()
+                    opt_num = _num(opt_value_str)
+                    if opt_num is not None and abs(pred_num - opt_num) < 1e-6:
+                        for g in golds:
+                            if opt_letter.upper() == g.upper():
+                                return True, 0.0, 1.0
+    
+    # 3. Fallback 文本匹配
+    pt = _norm(pred)
+    for g in golds:
+        gt = _norm(g)
+        if pt == gt or gt in pt or pt in gt:
+            return True, 0.0, 1.0
     
     return False, 1.0, 0.0
 
@@ -739,9 +531,7 @@ def default_prompt(ex: Example, tokenizer=None, use_chat_template=False,
 
 # =============== Backends ===============
 def build_generator(args):
-    """
-    Return: tokenizer_like, generate_batch(prompts)->List[str], max_model_len
-    """
+    """Return: tokenizer_like, generate_batch(prompts)->List[str], max_model_len"""
     max_model_len = args.max_input_tokens + args.max_new_tokens
 
     # ---------- vLLM (default) ----------
@@ -750,7 +540,7 @@ def build_generator(args):
         llm = LLM(
             model=args.model,
             tokenizer=args.tokenizer_path or args.model,
-            tensor_parallel_size=args.tp,                 # multi-card here
+            tensor_parallel_size=args.tp,
             max_model_len=max_model_len,
             trust_remote_code=True,
             dtype="half",
@@ -769,7 +559,6 @@ def build_generator(args):
     # ---------- SGLang (OpenAI-compatible client) ----------
     if args.backend == "sglang":
         import requests, concurrent.futures
-        # 为了 chat template，我们尽量加载本地 tokenizer；失败也不影响调用
         tok = None
         try:
             from transformers import AutoTokenizer
@@ -787,7 +576,6 @@ def build_generator(args):
             headers["Authorization"] = f"Bearer {args.sglang_api_key}"
 
         def _one(prompt: str) -> str:
-            # 用 chat.completions 端点
             payload = {
                 "model": model_id,
                 "messages": [{"role":"user","content": prompt}],
@@ -802,7 +590,6 @@ def build_generator(args):
             return js["choices"][0]["message"]["content"]
 
         def _gen_batch(prompts: List[str]) -> List[str]:
-            # 简单并发客户端（服务器端负责多卡/并行）
             outs = [None]*len(prompts)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,args.concurrency)) as ex:
                 futs = {ex.submit(_one, p): idx for idx,p in enumerate(prompts)}
@@ -824,10 +611,9 @@ def build_generator(args):
     )
     model_kwargs = dict(trust_remote_code=True, local_files_only=args.local_files_only)
     if args.device_map:
-        model_kwargs["device_map"] = args.device_map  # e.g., "auto" (multi-card if supported)
+        model_kwargs["device_map"] = args.device_map
     model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
-    # device placement
     if not args.device_map:
         if args.device.startswith("cuda"):
             model = model.to("cuda")
@@ -842,7 +628,6 @@ def build_generator(args):
         for p in prompts:
             inputs = tok(p, return_tensors="pt", truncation=True,
                          max_length=args.max_input_tokens)
-            # move to device
             if not args.device_map:
                 inputs = inputs.to(model.device)
             gen = model.generate(
@@ -859,28 +644,19 @@ def build_generator(args):
     return tok, _gen_batch, max_model_len
 
 # =============== IO helpers ===============
-# def write_json(path: str, examples: Iterable[Example]):
-#     data = [ex.meta["raw_rec"] for ex in examples]
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(data, f, ensure_ascii=False, indent=2)
-
 def _to_native(obj):
-       if isinstance(obj, np.ndarray):
-           return [_to_native(x) for x in obj.tolist()]
-       if isinstance(obj, np.generic):
-           return obj.item()
-       if isinstance(obj, dict):
-           return {k: _to_native(v) for k, v in obj.items()}
-       if isinstance(obj, (list, tuple)):
-           return [_to_native(v) for v in obj]
-       return obj
+    if isinstance(obj, np.ndarray):
+        return [_to_native(x) for x in obj.tolist()]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_native(v) for v in obj]
+    return obj
 
 def export_squadv2_original(input_path: str, output_path: str, examples: List[Example]):
-    """
-    对 SQuAD v2.0 本地 JSON（dev-v2.0.json）：
-    读入原始文件，按 examples 中保留的 id 过滤掉 easy 样本，
-    输出的 JSON 结构与原始完全一致（version + data/paragraphs/qas）。
-    """
+    """对 SQuAD v2.0 本地 JSON：读入原始文件，按 examples 中保留的 id 过滤掉 easy 样本"""
     with open(input_path, "r", encoding="utf-8") as f:
         orig = json.load(f)
 
@@ -891,7 +667,6 @@ def export_squadv2_original(input_path: str, output_path: str, examples: List[Ex
         new_paras = []
         for para in art.get("paragraphs", []):
             qas = para.get("qas", [])
-            # 只保留在 keep_ids 里的 QA
             filtered_qas = [qa for qa in qas if str(qa.get("id")) in keep_ids]
             if not filtered_qas:
                 continue
@@ -949,14 +724,14 @@ def export_squad_like(path: str, examples: List[Example]):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-# =============== Main ===============
-def _run_experiment(_config, _run):
+# =============== Main Experiment Logic ===============
+def run_experiment(_run, _config, _log):
     """
-    Main experiment logic wrapped by Sacred.
-    This function contains the original main() logic.
+    Main experiment logic.
+    This function contains all the core execution logic for data cleaning experiments.
     """
-    # Initialize configuration from Sacred config and YAML files
-    args = init_config_from_sacred_and_yaml(_config)
+    # Initialize configuration from Sacred config
+    args = init_config_from_sacred(_config)
     
     # Validate required parameters
     if not args.dataset:
@@ -975,7 +750,7 @@ def _run_experiment(_config, _run):
     t_start = time()
     start_iso = datetime.now().isoformat(timespec="seconds")
 
-    # 给这次 run 建一个目录（目前只是占位，方便以后扩展）
+    # 给这次 run 建一个目录
     run_id = args.run_tag or f"{args.dataset}__{datetime.now():%y%m%d_%H%M%S}"
     run_dir = Path(args.results_dir) / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -987,7 +762,6 @@ def _run_experiment(_config, _run):
     
     # Convert to Example objects
     examples: List[Example] = []
-    adapter_mod = dataset_loader._adapter_mod
     for x in raw_data:
         if isinstance(x, Example):
             examples.append(x)
@@ -1007,7 +781,6 @@ def _run_experiment(_config, _run):
     task_type = "extractive" if args.dataset in ("squadv2","hotpot","nq") else "math"
 
     if args.max_eval_examples and args.max_eval_examples > 0 and len(examples) > args.max_eval_examples:
-        import random
         random.seed(args.seed)
         examples = random.sample(examples, args.max_eval_examples)
         print(f"[Debug] Only evaluate {len(examples)} examples (random subset, seed={args.seed})")
@@ -1032,7 +805,6 @@ def _run_experiment(_config, _run):
                 return dataset_loader.build_prompt(ex, tokenizer)
             
             def generate_batch(prompts: List[str]) -> List[str]:
-                # Use agent for generation (without tool calling for batch processing)
                 return [agent.generate(p) for p in prompts]
         else:
             use_agent = False
@@ -1057,7 +829,6 @@ def _run_experiment(_config, _run):
     bs = max(1, args.batch_size)
     kept: List[Example] = []
     logs: List[Dict[str, Any]] = []
-    # 用于保存答案对比（仅 gsm8k 和 math）
     answer_comparisons: List[Dict[str, Any]] = []
 
     t0 = time()
@@ -1095,7 +866,7 @@ def _run_experiment(_config, _run):
                 # 其他将来可能的抽取式数据集，仍走旧的 F1/EM 兜底
                 hit, s1, s2 = match_extractive(pred, ex.answers, args.f1_threshold)
             else:
-                hit, s1, s2 = match_math(pred, ex.answers)
+                hit, s1, s2 = match_math(pred, ex.answers, args.dataset)
 
             # 对于 gsm8k 和 math，保存答案对比
             if args.dataset in ("gsm8k", "math","omini"):
@@ -1115,28 +886,24 @@ def _run_experiment(_config, _run):
 
             is_easy = bool(hit)  # hit = 小模型能答 → 过滤
             if args.eval_only or not is_easy:
-                # 把模型完整输出挂到 Example.meta 里，写 output json 时一起保存
-                # raw_pred 是上面刚刚定义的“原始完整输出”（含 <think>）
                 if args.store_think:
-                    # 复制一份 meta，避免共享引用
                     ex.meta = dict(ex.meta)
-                    ex.meta["model_output"] = raw_pred          # 含 <think> 的完整输出
-                    ex.meta["model_answer"] = pred_for_score    # 抽出来用于打分的短答案
+                    ex.meta["model_output"] = raw_pred
+                    ex.meta["model_answer"] = pred_for_score
 
                 kept.append(ex)
             log_item = {
                 "id": ex.id,
                 "dataset": args.dataset,
                 "is_easy": int(is_easy),
-                "score1": float(s1),           # F1 或其他分
-                "score2": float(s2),           # EM 或备用分
-                "pred": pred_for_score,        # 用于判定的最终文本（短答案）
-                "answers": ex.answers,         # ground-truth 全量列表
+                "score1": float(s1),
+                "score2": float(s2),
+                "pred": pred_for_score,
+                "answers": ex.answers,
                 "is_unanswerable": bool(getattr(ex, "is_unanswerable", False)),
                 "question": (ex.question[:120] + "...") if len(ex.question) > 120 else ex.question,
             }
             if args.store_think:
-                # 保存完整 CoT 输出，方便排查
                 log_item["pred_raw"] = raw_pred
             if args.store_prompt:
                 log_item["prompt"] = used_prompt
@@ -1147,20 +914,20 @@ def _run_experiment(_config, _run):
     t1 = time()
     print(f"[Done] kept {len(kept)} / {len(examples)} in {t1-t0:.1f}s")
 
-    eval_time_sec = t1 - t0                      # 纯模型推理+判定用时
+    eval_time_sec = t1 - t0
     per_example_time = eval_time_sec / max(1, len(examples))
     end_iso = datetime.now().isoformat(timespec="seconds")
-    wall_time_sec = time() - t_start             # 从 main 开始到这里的总耗时
+    wall_time_sec = time() - t_start
 
     # 1) 先做抽样（只对 squadv2/hotpot/nq）
     if args.dataset in ("squadv2", "hotpot", "nq") and args.sample_size and len(kept) > args.sample_size:
-        # 为未命中的（kept=困难样本）构建 id->F1 映射；缺失F1的当成 +inf 放到末尾
         f1_by_id = {r["id"]: (float(r["score1"]) if r.get("score1") is not None else float("inf"))
                     for r in logs if not r["is_easy"]}
 
         kept_sorted = sorted(kept, key=lambda ex: f1_by_id.get(ex.id, float("inf")))
         kept = kept_sorted[:args.sample_size]
         print(f"[Sample] selected {len(kept)} hardest examples by lowest F1.")
+    
     # 2) 再计算统计量（total / hits / accuracy）
     total = len(logs)
     hits = sum(int(r["is_easy"]) for r in logs)
@@ -1183,23 +950,19 @@ def _run_experiment(_config, _run):
     else:
         print("[Write] skip run logs because --no_logs is set")
 
-
     # 3) 自然语言三套的 summary
     if args.dataset in ("squadv2", "hotpot", "nq"):
         def _avg(vals):
             return float(sum(vals)/len(vals)) if vals else 0.0
 
-        # 全量上的平均F1（筛选前）
         f1_all_vals = [float(r["score1"]) for r in logs if r.get("score1") is not None]
         avg_f1_all  = _avg(f1_all_vals)
 
-        # 困难集合（kept）的平均F1（筛选后，按“过滤后/或500最难子集”）
         kept_ids = {ex.id for ex in kept}
         f1_kept_vals = [float(r["score1"]) for r in logs
                         if (r.get("score1") is not None and r["id"] in kept_ids)]
         avg_f1_kept = _avg(f1_kept_vals)
 
-        # 时间：筛选前为真实耗时；筛选后用 单样本均时 * kept 数量 估算
         test_time_before_sec = eval_time_sec
         test_time_after_sec_est = per_example_time * len(kept)
 
@@ -1209,12 +972,11 @@ def _run_experiment(_config, _run):
             "dataset": args.dataset,
             "total_examples_before": len(examples),
             "total_examples_after": len(kept),
-            # “测一次全部样本”的时间（当前 run 实测 & 按 kept 估算）
             "test_time_before_sec": test_time_before_sec,
             "test_time_after_sec_est": test_time_after_sec_est,
             "avg_f1_before": avg_f1_all,
             "avg_f1_after": avg_f1_kept,
-            "accuracy_easy_ratio": accuracy,      # 小模型命中率（易样本比例）
+            "accuracy_easy_ratio": accuracy,
             "run_start": start_iso,
             "run_end": end_iso,
             "run_wall_time_sec": wall_time_sec,
@@ -1236,7 +998,6 @@ def _run_experiment(_config, _run):
             json.dump(summary_payload, f, ensure_ascii=False, indent=2)
         print(f"[Write] natural summary -> {summary_dir / f'{args.dataset}.json'}")
 
-
     # statistics
     total = len(logs)
     hits = sum(r["is_easy"] for r in logs)
@@ -1249,10 +1010,7 @@ def _run_experiment(_config, _run):
         summary_dir.mkdir(parents=True, exist_ok=True)
         summary_path = summary_dir / f"{args.dataset}.json"
 
-        # 筛选前：accuracy = 小模型在全量上的命中率（即 easy 比例）
         test_time_before_sec = eval_time_sec
-
-        # 筛选后（保留困难样本，本轮就是 kept）：小模型在 kept 上的准确率为 0（定义上它们是未命中）
         accuracy_after = 0.0
         test_time_after_sec_est = per_example_time * len(kept)
 
@@ -1282,29 +1040,24 @@ def _run_experiment(_config, _run):
             json.dump(summary_payload, f, ensure_ascii=False, indent=2)
         print(f"[Write] summary json -> {summary_path}")
 
-
-    # outputs
     # outputs
     if not args.eval_only:
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
-        #  对 SQuAD v2 + 本地 JSON，按原始结构导出
         if args.dataset == "squadv2" and args.source == "json" and args.input:
             export_squadv2_original(args.input, args.output, kept)
         else:
-            # 其它数据集还是用 adapter 提供的 raw_rec 扁平导出
             write_json(args.output, kept)
 
         print(f"[Write] filtered json -> {args.output}")
 
-        # 2) 额外：带 think + answer 的 cleaned 数据集，写到 results 下面
+        # 2) 额外：带 think + answer 的 cleaned 数据集
         if args.store_think:
             rich_records = []
             for ex in kept:
                 meta = getattr(ex, "meta", {}) or {}
                 base = meta.get("raw_rec")
 
-                # 如果没有 raw_rec，就退化成标准 Example schema
                 if base is None:
                     base = {
                         "id": ex.id,
@@ -1316,7 +1069,6 @@ def _run_experiment(_config, _run):
                 else:
                     base = _to_native(base)
 
-                # 补上模型输出
                 if "model_output" in meta:
                     base["model_output"] = meta["model_output"]
                 if "model_answer" in meta:
@@ -1356,64 +1108,4 @@ def _run_experiment(_config, _run):
         "accuracy": accuracy,
         "wall_time": wall_time_sec,
     }
-        
-def match_multiple_choice(pred: str, golds: List[str], options: List[str] = None) -> Tuple[bool, float, float]:
-    """
-    匹配多选题答案（如 AQuA）
-    支持：
-    - 直接匹配字母：A, B, C, D, E
-    - 从文本中提取：The answer is E
-    - 通过数字反推：如果输出 23，且选项 E)23，则匹配 E
-    """
-    pred = pred.strip()
-    
-    # 1. 直接提取字母（A-E）
-    # 匹配单独的字母或 "answer is X" 格式
-    letter_match = re.search(r'\b([A-E])\b', pred.upper())
-    if letter_match:
-        pred_letter = letter_match.group(1)
-        for g in golds:
-            if pred_letter.upper() == g.upper():
-                return True, 0.0, 1.0
-    
-    # 2. 如果提供了 options，尝试通过数字反推
-    if options:
-        pred_num = _num(pred)
-        if pred_num is not None:
-            # 遍历选项，看哪个选项包含这个数字
-            for opt in options:
-                # 选项格式：A)21, B)21.5, C)22, D)22.5, E)23
-                opt_match = re.match(r'([A-E])\)(.*)', opt.strip())
-                if opt_match:
-                    opt_letter = opt_match.group(1)
-                    opt_value_str = opt_match.group(2).strip()
-                    opt_num = _num(opt_value_str)
-                    if opt_num is not None and abs(pred_num - opt_num) < 1e-6:
-                        # 找到了对应的选项，检查是否是正确答案
-                        for g in golds:
-                            if opt_letter.upper() == g.upper():
-                                return True, 0.0, 1.0
-    
-    # 3. Fallback 文本匹配
-    pt = _norm(pred)
-    for g in golds:
-        gt = _norm(g)
-        if pt == gt or gt in pt or pt in gt:
-            return True, 0.0, 1.0
-    
-    return False, 1.0, 0.0
 
-# Register main function with Sacred
-@ex.main
-def main(_config, _run):
-    """Sacred main function"""
-    return _run_experiment(_config, _run)
-
-if __name__ == "__main__":
-    # Add file observer for Sacred
-    results_dir = Path("results") / "sacred"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    ex.observers.append(FileStorageObserver(str(results_dir)))
-    
-    # Run Sacred experiment
-    ex.run_commandline()

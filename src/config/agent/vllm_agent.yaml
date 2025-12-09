@@ -1,0 +1,54 @@
+
+
+# Backend configuration (default: vllm)
+backend: "vllm"
+
+# Model configuration
+model_path: ""  # Local model path (required)
+tokenizer_path: null  # Optional, defaults to model_path
+
+# vLLM backend settings
+vllm:
+  tensor_parallel_size: 1  # Number of GPUs for tensor parallelism
+  gpu_memory_utilization: 0.9  # GPU memory usage (0.0-1.0)
+
+# Generation parameters
+generation:
+  temperature: 0.7  # Sampling temperature (0.0-2.0, higher = more random)
+  top_p: 1.0  # Nucleus sampling parameter (0.0-1.0)
+  max_tokens: 2048  # Maximum input tokens
+  max_new_tokens: 2048  # Maximum output tokens
+
+# Tool configuration
+# To enable tools, add tool names to 'available' list below
+tools:
+  enabled: true  # Set to false to disable all tools
+  available: []  # Add tool names here: ["code", "search", "mind_map"]
+  
+
+  code:
+    model: null  # Model for code generation (null = use main model)
+    working_dir: "./tmp"  # Directory for temporary code files
+    timeout: 10  # Code execution timeout in seconds
+  
+
+  search:
+    bing_subscription_key: null  # REQUIRED: Your Bing Search API key from Azure
+    bing_endpoint: "https://api.bing.microsoft.com/v7.0/search"  # Bing API endpoint
+    top_k: 10  # Number of search results to return
+    use_jina: true  # Use Jina for enhanced page content extraction
+    jina_api_key: null  # Optional: Jina API key for better content extraction
+    max_doc_len: 1000  # Maximum document length in characters
+  
+  mind_map:
+    working_dir: "./local_mem"  # Directory for knowledge graph storage
+    initial_content: ""  # Optional: Initial content to insert into graph
+
+# Tool call parsing configuration
+tool_calling:
+  format: "json"  # Tool call format: "json", "function_call", or "auto"
+  max_iterations: 5  # Maximum tool call iterations per request
+
+# System prompt (optional)
+system_prompt: null  # Custom system prompt, null = use default
+

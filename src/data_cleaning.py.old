@@ -312,6 +312,15 @@ def load_by_adapter(args) -> Tuple[List[Example], Any]:
     for x in raw:
         if isinstance(x, Example):
             exs.append(x)
+        elif isinstance(x, dict):
+            exs.append(Example(
+                id=str(x.get("id")),
+                question=x.get("question",""),
+                context=x.get("context",""),
+                answers=list(x.get("answers", [])),
+                is_unanswerable=bool(x.get("is_unanswerable", False)),
+                meta={k:v for k,v in x.items() if k not in ["id","question","context","answers","is_unanswerable"]}
+            ))
         else:
             raise TypeError("Adapter.load must return Example or dict.")
     return exs, mod
