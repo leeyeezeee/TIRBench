@@ -12,7 +12,6 @@ import os
 import re
 import random
 import sys
-from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 from collections import Counter
 from time import time
@@ -25,83 +24,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from dataformator.dataset_loader import DatasetLoader
 try:
-    from modelloader.llm_agent import LLMAgent
+    from modelloader.llm_agent import LLMAgent, AgentConfig
 except ImportError:
     LLMAgent = None
+    AgentConfig = None
 
-# =============== Example schema ===============
-@dataclass
-class Example:
-    id: str
-    question: str
-    context: str
-    answers: List[str]
-    is_unanswerable: bool = False
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-# =============== Configuration Object ===============
-class ConfigObject:
-    """Simple object to hold configuration like argparse.Namespace"""
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-    
-    def __getattr__(self, name):
-        # Return None for missing attributes to maintain compatibility
-        return None
-
-# =============== Configuration Initialization ===============
-def init_config_from_sacred(sacred_config: Dict[str, Any]) -> ConfigObject:
-    """
-    Initialize configuration from Sacred config.
-    The config has already been merged with YAML files in main.py.
-    """
-    # Start with Sacred config values
-    config_dict = dict(sacred_config)
-    
-    # Merge dataset config if present
-    dataset_config = sacred_config.get("dataset_config", {})
-    if dataset_config:
-        if dataset_config.get("default_source"):
-            config_dict["source"] = dataset_config["default_source"]
-        if dataset_config.get("default_input"):
-            config_dict["input"] = os.path.expandvars(dataset_config["default_input"])
-    
-    # Merge agent config if present
-    agent_config = sacred_config.get("agent_config", {})
-    if agent_config:
-        if agent_config.get("backend"):
-            config_dict["backend"] = agent_config["backend"]
-        if agent_config.get("model_path"):
-            config_dict["model"] = agent_config["model_path"]
-        if agent_config.get("tokenizer_path"):
-            config_dict["tokenizer_path"] = agent_config["tokenizer_path"]
-        
-        # Merge generation params
-        if agent_config.get("generation"):
-            gen = agent_config["generation"]
-            if "temperature" in gen:
-                config_dict["temperature"] = gen["temperature"]
-            if "top_p" in gen:
-                config_dict["top_p"] = gen["top_p"]
-            if "max_tokens" in gen:
-                config_dict["max_input_tokens"] = gen["max_tokens"]
-            if "max_new_tokens" in gen:
-                config_dict["max_new_tokens"] = gen["max_new_tokens"]
-        
-        # Merge vLLM config
-        if agent_config.get("vllm"):
-            vllm_config = agent_config["vllm"]
-            if "tensor_parallel_size" in vllm_config:
-                config_dict["tp"] = vllm_config["tensor_parallel_size"]
-            if "gpu_memory_utilization" in vllm_config:
-                config_dict["gpu_memory_utilization"] = vllm_config["gpu_memory_utilization"]
-    
-    # Handle input_path vs input
-    if "input_path" in config_dict and config_dict["input_path"]:
-        config_dict["input"] = config_dict["input_path"]
-    
-    return ConfigObject(**config_dict)
 
 # =============== Extractive metrics (EM/F1) ===============
 _ART = re.compile(r"\b(a|an|the)\b", re.UNICODE)
@@ -184,48 +111,55 @@ def extract_qa_answer(s: str) -> str:
 
     return ans
 
-def _judge_squad(pred, ex, args):
+def _judge_squad(pred, ex, config):
     # SQuAD v2：有 NoAns；命中 NoAns 或 HasAns 用 F1/EM
-    if ex.is_unanswerable or not ex.answers or _norm(ex.answers[0]) in _UNANS:
+    is_unanswerable = ex.get("is_unanswerable", False)
+    answers = ex.get("answers", [])
+    if is_unanswerable or not answers or _norm(answers[0]) in _UNANS:
         hit = _is_unanswerable_pred(pred)
         return hit, 1.0 if hit else 0.0, 1.0 if hit else 0.0
-    thr = args.squad_f1_threshold or args.f1_threshold
-    return match_extractive(pred, ex.answers, thr)
+    thr = config.get('squad_f1_threshold') or config.get('f1_threshold', 0.8)
+    return match_extractive(pred, answers, thr)
 
-def _judge_hotpot(pred, ex, args):
+def _judge_hotpot(pred, ex, config):
     # Hotpot：只有答案，不考虑 NoAns
-    thr = args.hotpot_f1_threshold or args.f1_threshold
-    return match_extractive(pred, ex.answers, thr)
+    answers = ex.get("answers", [])
+    thr = config.get('hotpot_f1_threshold') or config.get('f1_threshold', 0.8)
+    return match_extractive(pred, answers, thr)
 
-def _judge_nq(pred, ex, args):
+def _judge_nq(pred, ex, config):
     # NQ：Yes/No → EM；短答案 → F1；也可能出现 NoAns
-    if ex.is_unanswerable or not ex.answers or _norm(ex.answers[0]) in _UNANS:
+    is_unanswerable = ex.get("is_unanswerable", False)
+    answers = ex.get("answers", [])
+    if is_unanswerable or not answers or _norm(answers[0]) in _UNANS:
         hit = _is_unanswerable_pred(pred)
         return hit, 1.0 if hit else 0.0, 1.0 if hit else 0.0
-    if _is_yes_no_answers(ex.answers):
+    if _is_yes_no_answers(answers):
         # 统一成 yes/no 之后做 EM
-        hit = (_norm(pred) in {"yes", "no"} and _norm(pred) in {_norm(a) for a in ex.answers})
+        hit = (_norm(pred) in {"yes", "no"} and _norm(pred) in {_norm(a) for a in answers})
         return hit, 1.0 if hit else 0.0, 1.0 if hit else 0.0
-    thr = args.nq_f1_threshold or args.f1_threshold
-    return match_extractive(pred, ex.answers, thr)
+    thr = config.get('nq_f1_threshold') or config.get('f1_threshold', 0.8)
+    return match_extractive(pred, answers, thr)
 
-def judge_easy(dataset: str, pred: str, ex, args):
+def judge_easy(dataset: str, pred: str, ex, config):
     """按数据集返回 (hit, f1, em)"""
-    if args.decision == "em":
-        em = float(_norm(pred) in {_norm(a) for a in (ex.answers or [])})
+    answers = ex.get("answers", [])
+    decision = config.get('decision', 'auto')
+    if decision == "em":
+        em = float(_norm(pred) in {_norm(a) for a in (answers or [])})
         return (em >= 1.0), 0.0, em
-    if args.decision == "f1":
-        return match_extractive(pred, ex.answers, args.f1_threshold)
+    if decision == "f1":
+        return match_extractive(pred, answers, config.get('f1_threshold', 0.8))
 
     # auto：按数据集走合适规则
-    if args.decision in ("auto","squad_v2") and dataset == "squadv2":
-        return _judge_squad(pred, ex, args)
-    if args.decision in ("auto","hotpot") and dataset == "hotpot":
-        return _judge_hotpot(pred, ex, args)
-    if args.decision in ("auto","nq") and dataset == "nq":
-        return _judge_nq(pred, ex, args)
+    if decision in ("auto","squad_v2") and dataset == "squadv2":
+        return _judge_squad(pred, ex, config)
+    if decision in ("auto","hotpot") and dataset == "hotpot":
+        return _judge_hotpot(pred, ex, config)
+    if decision in ("auto","nq") and dataset == "nq":
+        return _judge_nq(pred, ex, config)
 
-    return match_extractive(pred, ex.answers, args.f1_threshold)
+    return match_extractive(pred, answers, config.get('f1_threshold', 0.8))
 
 # =============== Math metrics ===============
 _BOXED = re.compile(r"\\boxed\{([^}]*)\}")
@@ -503,145 +437,91 @@ def match_multiple_choice(pred: str, golds: List[str], options: List[str] = None
     
     return False, 1.0, 0.0
 
-# =============== Prompt builders ===============
-def default_prompt(ex: Example, tokenizer=None, use_chat_template=False,
-                   include_unanswerable_hint=False, handle_unanswerable=False,
-                   task_type: str="extractive") -> str:
-    if task_type == "extractive":
-        hint = "\nIf the question cannot be answered from the context, reply with: 'unanswerable'." \
-               if include_unanswerable_hint else ""
-        content = f"Context:\n{ex.context}\n\nQuestion: {ex.question}\nAnswer:{hint}\n"
-        if use_chat_template and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
-            msgs=[{"role":"system","content":"You are a helpful RC assistant."},
-                  {"role":"user","content":content}]
-            return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        return content
-
-    # math
-    content = (
-        "Solve the following problem. Respond with the final numeric answer only. "
-        "If it is a fraction/percentage, give the numeric form.\n"
-        f"Problem: {ex.question}\nAnswer:"
+# =============== LLM Agent Helper ===============
+def build_agent_from_args(config: Dict[str, Any], use_tools: bool = False) -> Tuple[LLMAgent, Any]:
+    """
+    Build LLMAgent from config dictionary.
+    
+    Args:
+        config: Configuration dictionary (from Sacred _config)
+        use_tools: Whether to enable tools (if False, tools are disabled even if configured)
+    
+    Returns:
+        Tuple of (LLMAgent instance, tokenizer)
+    """
+    if LLMAgent is None or AgentConfig is None:
+        raise ImportError("LLMAgent is not available. Please ensure modelloader.llm_agent is importable.")
+    
+    # Get agent_config dict for nested access
+    agent_config_dict = config.get('agent_config', {}) or {}
+    if not isinstance(agent_config_dict, dict):
+        agent_config_dict = {}
+    
+    # Handle backend-specific configs
+    backend = config.get('backend', 'vllm')
+    vllm_config = agent_config_dict.get('vllm', {})
+    transformers_config = agent_config_dict.get('transformers', {})
+    sglang_config = agent_config_dict.get('sglang', {})
+    
+    # Handle tool configs
+    tools_config = agent_config_dict.get('tools', {})
+    code_config = tools_config.get('code', {})
+    search_config = tools_config.get('search', {})
+    mind_map_config = tools_config.get('mind_map', {})
+    
+    # Handle tool calling config
+    tool_calling_config = agent_config_dict.get('tool_calling', {})
+    
+    # Handle generation config
+    generation_config = agent_config_dict.get('generation', {})
+    
+    # Get model path - prefer from agent_config, fallback to top-level
+    model_path = agent_config_dict.get('model_path') or config.get('model', '')
+    tokenizer_path = agent_config_dict.get('tokenizer_path') or config.get('tokenizer_path')
+    
+    # Handle sglang model name
+    if backend == 'sglang':
+        model_path = config.get('sglang_model') or model_path
+    
+    # Build AgentConfig from config
+    agent_config = AgentConfig(
+        backend=backend,
+        model_path=model_path,
+        tokenizer_path=tokenizer_path,
+        remote_model=agent_config_dict.get('remote_model') or config.get('remote_model'),
+        
+        # Backend-specific
+        tensor_parallel_size=vllm_config.get('tensor_parallel_size', config.get('tp', 1)),
+        gpu_memory_utilization=vllm_config.get('gpu_memory_utilization', config.get('gpu_memory_utilization', 0.9)),
+        device=transformers_config.get('device', config.get('device', 'cuda')),
+        device_map=transformers_config.get('device_map') or config.get('device_map'),
+        api_base=sglang_config.get('api_base') or config.get('sglang_api_base'),
+        api_key=sglang_config.get('api_key') or config.get('sglang_api_key'),
+        
+        # Generation - prefer from generation config, fallback to top-level
+        temperature=generation_config.get('temperature', config.get('temperature', 0.7)),
+        top_p=generation_config.get('top_p', config.get('top_p', 1.0)),
+        max_tokens=generation_config.get('max_tokens', config.get('max_input_tokens', 2048)),
+        max_new_tokens=generation_config.get('max_new_tokens', config.get('max_new_tokens', 2048)),
+        
+        # Tools
+        enable_tools=use_tools and tools_config.get('enabled', False),
+        tools=tools_config.get('available', []) if use_tools else [],
+        code_model=code_config.get('model'),
+        bing_subscription_key=search_config.get('bing_subscription_key'),
+        bing_endpoint=search_config.get('bing_endpoint'),
+        mind_map_dir=mind_map_config.get('working_dir', './local_mem'),
+        
+        # Tool calling
+        tool_call_format=tool_calling_config.get('format', 'json'),
+        max_tool_iterations=tool_calling_config.get('max_iterations', 5),
+        system_prompt=agent_config_dict.get('system_prompt'),
     )
-    if use_chat_template and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
-        msgs=[{"role":"system","content":"You are a careful math solver."},
-              {"role":"user","content":content}]
-        return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    return content
-
-# =============== Backends ===============
-def build_generator(args):
-    """Return: tokenizer_like, generate_batch(prompts)->List[str], max_model_len"""
-    max_model_len = args.max_input_tokens + args.max_new_tokens
-
-    # ---------- vLLM (default) ----------
-    if args.backend == "vllm":
-        from vllm import LLM, SamplingParams
-        llm = LLM(
-            model=args.model,
-            tokenizer=args.tokenizer_path or args.model,
-            tensor_parallel_size=args.tp,
-            max_model_len=max_model_len,
-            trust_remote_code=True,
-            dtype="half",
-            gpu_memory_utilization=args.gpu_memory_utilization,
-        )
-        tok = llm.get_tokenizer()
-        sp = SamplingParams(temperature=args.temperature, top_p=args.top_p,
-                            max_tokens=args.max_new_tokens)
-
-        def _gen_batch(prompts: List[str]) -> List[str]:
-            outs = llm.generate(prompts, sp)
-            return [o.outputs[0].text for o in outs]
-
-        return tok, _gen_batch, max_model_len
-
-    # ---------- SGLang (OpenAI-compatible client) ----------
-    if args.backend == "sglang":
-        import requests, concurrent.futures
-        tok = None
-        try:
-            from transformers import AutoTokenizer
-            tok = AutoTokenizer.from_pretrained(
-                args.tokenizer_path or args.model,
-                trust_remote_code=True, local_files_only=args.local_files_only
-            )
-        except Exception:
-            tok = None
-
-        api_base = args.sglang_api_base.rstrip("/")
-        model_id = args.sglang_model or args.model
-        headers = {"Content-Type":"application/json"}
-        if args.sglang_api_key:
-            headers["Authorization"] = f"Bearer {args.sglang_api_key}"
-
-        def _one(prompt: str) -> str:
-            payload = {
-                "model": model_id,
-                "messages": [{"role":"user","content": prompt}],
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "max_tokens": args.max_new_tokens
-            }
-            r = requests.post(f"{api_base}/v1/chat/completions",
-                              headers=headers, data=json.dumps(payload), timeout=120)
-            r.raise_for_status()
-            js = r.json()
-            return js["choices"][0]["message"]["content"]
-
-        def _gen_batch(prompts: List[str]) -> List[str]:
-            outs = [None]*len(prompts)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,args.concurrency)) as ex:
-                futs = {ex.submit(_one, p): idx for idx,p in enumerate(prompts)}
-                for fut in concurrent.futures.as_completed(futs):
-                    idx = futs[fut]
-                    try:
-                        outs[idx] = fut.result()
-                    except Exception as e:
-                        outs[idx] = f"[ERROR:{e}]"
-            return outs
-
-        return tok, _gen_batch, max_model_len
-
-    # ---------- Transformers ----------
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    import torch
-    tok = AutoTokenizer.from_pretrained(
-        args.model, trust_remote_code=True, local_files_only=args.local_files_only
-    )
-    model_kwargs = dict(trust_remote_code=True, local_files_only=args.local_files_only)
-    if args.device_map:
-        model_kwargs["device_map"] = args.device_map
-    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
-
-    if not args.device_map:
-        if args.device.startswith("cuda"):
-            model = model.to("cuda")
-        elif args.device.startswith("npu"):
-            import torch_npu  # noqa
-            model = model.to(args.device)
-        else:
-            model = model.to("cpu")
-
-    def _gen_batch(prompts: List[str]) -> List[str]:
-        outs = []
-        for p in prompts:
-            inputs = tok(p, return_tensors="pt", truncation=True,
-                         max_length=args.max_input_tokens)
-            if not args.device_map:
-                inputs = inputs.to(model.device)
-            gen = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                temperature=args.temperature,
-                eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id
-            )
-            text = tok.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-            outs.append(text)
-        return outs
-
-    return tok, _gen_batch, max_model_len
+    
+    # Build agent from AgentConfig
+    agent = LLMAgent(agent_config)
+    
+    return agent, agent.tokenizer
 
 # =============== IO helpers ===============
 def _to_native(obj):
@@ -655,12 +535,12 @@ def _to_native(obj):
         return [_to_native(v) for v in obj]
     return obj
 
-def export_squadv2_original(input_path: str, output_path: str, examples: List[Example]):
+def export_squadv2_original(input_path: str, output_path: str, examples: List[Dict[str, Any]]):
     """对 SQuAD v2.0 本地 JSON：读入原始文件，按 examples 中保留的 id 过滤掉 easy 样本"""
     with open(input_path, "r", encoding="utf-8") as f:
         orig = json.load(f)
 
-    keep_ids = {str(ex.id) for ex in examples}
+    keep_ids = {str(ex.get("id")) for ex in examples}
 
     new_data = []
     for art in orig.get("data", []):
@@ -691,7 +571,8 @@ def export_squadv2_original(input_path: str, output_path: str, examples: List[Ex
 def write_json(path, examples):
     data = []
     for ex in examples:
-        raw = getattr(ex, "meta", {}).get("raw_rec")
+        meta = ex.get("meta", {})
+        raw = meta.get("raw_rec")
         if raw is not None:
             data.append(_to_native(raw))
     with open(path, "w", encoding="utf-8") as f:
@@ -706,17 +587,17 @@ def write_csv(path: str, rows: List[Dict[str, Any]]):
         for r in rows:
             w.writerow(r)
 
-def export_squad_like(path: str, examples: List[Example]):
+def export_squad_like(path: str, examples: List[Dict[str, Any]]):
     data = []
     paras = []
     for ex in examples:
         paras.append({
-            "context": ex.context,
+            "context": ex.get("context", ""),
             "qas": [{
-                "id": ex.id,
-                "question": ex.question,
-                "answers": [{"text": a, "answer_start": -1} for a in ex.answers],
-                "is_impossible": ex.is_unanswerable
+                "id": ex.get("id"),
+                "question": ex.get("question", ""),
+                "answers": [{"text": a, "answer_start": -1} for a in ex.get("answers", [])],
+                "is_impossible": ex.get("is_unanswerable", False)
             }]
         })
     data.append({"title":"filtered","paragraphs":paras})
@@ -730,104 +611,109 @@ def run_experiment(_run, _config, _log):
     Main experiment logic.
     This function contains all the core execution logic for data cleaning experiments.
     """
-    # Initialize configuration from Sacred config
-    args = init_config_from_sacred(_config)
+    # Use _config directly (already merged in main.py)
+    config = _config
+    
+    # Handle input_path vs input
+    if config.get("input_path") and not config.get("input"):
+        config["input"] = config["input_path"]
+    
+    # Merge dataset config if present
+    dataset_config = config.get("dataset_config", {})
+    if dataset_config:
+        if dataset_config.get("default_source") and not config.get("source"):
+            config["source"] = dataset_config["default_source"]
+        if dataset_config.get("default_input") and not config.get("input"):
+            config["input"] = os.path.expandvars(dataset_config["default_input"])
     
     # Validate required parameters
-    if not args.dataset:
+    if not config.get("dataset"):
         raise ValueError("dataset is required")
-    if not args.model:
+    if not config.get("model"):
         raise ValueError("model is required")
-    if not args.output:
+    if not config.get("output"):
         raise ValueError("output is required")
     
     # Log configuration to Sacred
-    _run.log_scalar("config.dataset", args.dataset)
-    _run.log_scalar("config.backend", args.backend)
-    _run.log_scalar("config.model", args.model)
+    _run.log_scalar("config.dataset", config.get("dataset"))
+    _run.log_scalar("config.backend", config.get("backend"))
+    _run.log_scalar("config.model", config.get("model"))
 
     # 全局运行时间（加载+推理+写结果）
     t_start = time()
     start_iso = datetime.now().isoformat(timespec="seconds")
 
     # 给这次 run 建一个目录
-    run_id = args.run_tag or f"{args.dataset}__{datetime.now():%y%m%d_%H%M%S}"
-    run_dir = Path(args.results_dir) / "runs" / run_id
+    run_id = config.get("run_tag") or f"{config.get('dataset')}__{datetime.now():%y%m%d_%H%M%S}"
+    run_dir = Path(config.get("results_dir", "results")) / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # load data using DatasetLoader
-    print(f"[Load] dataset={args.dataset} source={args.source} split={args.split} input={args.input}")
-    dataset_loader = DatasetLoader(args.dataset)
-    raw_data = dataset_loader.load(args)
-    
-    # Convert to Example objects
-    examples: List[Example] = []
-    for x in raw_data:
-        if isinstance(x, Example):
-            examples.append(x)
-        elif isinstance(x, dict):
-            examples.append(Example(
-                id=str(x.get("id")),
-                question=x.get("question",""),
-                context=x.get("context",""),
-                answers=list(x.get("answers", [])),
-                is_unanswerable=bool(x.get("is_unanswerable", False)),
-                meta={k:v for k,v in x.items() if k not in ["id","question","context","answers","is_unanswerable"]}
-            ))
-        else:
-            raise TypeError("DatasetLoader.load must return Example or dict.")
+    print(f"[Load] dataset={config.get('dataset')} source={config.get('source')} split={config.get('split')} input={config.get('input')}")
+    dataset_loader = DatasetLoader(config.get("dataset"))
+    examples = dataset_loader.load(config)
     print(f"[Load] {len(examples)} examples")
 
-    task_type = "extractive" if args.dataset in ("squadv2","hotpot","nq") else "math"
+    task_type = "extractive" if config.get("dataset") in ("squadv2","hotpot","nq") else "math"
 
-    if args.max_eval_examples and args.max_eval_examples > 0 and len(examples) > args.max_eval_examples:
-        random.seed(args.seed)
-        examples = random.sample(examples, args.max_eval_examples)
-        print(f"[Debug] Only evaluate {len(examples)} examples (random subset, seed={args.seed})")
+    max_eval_examples = config.get("max_eval_examples", 0)
+    if max_eval_examples and max_eval_examples > 0 and len(examples) > max_eval_examples:
+        random.seed(config.get("seed", 42))
+        examples = random.sample(examples, max_eval_examples)
+        print(f"[Debug] Only evaluate {len(examples)} examples (random subset, seed={config.get('seed', 42)})")
 
-    # backend - use LLMAgent if tools are enabled, otherwise use direct backend
-    print(f"[Init] backend={args.backend} model={args.model}")
+    # backend - always use LLMAgent (with or without tools)
+    print(f"[Init] backend={config.get('backend')} model={config.get('model')}")
     
-    use_agent = _config.get("use_agent_tools", False) and LLMAgent is not None
-    if use_agent:
-        # Initialize LLMAgent with tools (if configured)
-        agent_config_path = None
-        if _config.get("agent_config_file"):
-            agent_config_path = str(Path(__file__).parent.parent / "config" / "agent" / _config["agent_config_file"])
-        else:
-            agent_config_path = str(Path(__file__).parent.parent / "config" / "agent" / "default.yaml")
-        
-        if Path(agent_config_path).exists():
-            agent = LLMAgent.from_config(agent_config_path)
-            tokenizer = agent.tokenizer
-            
-            def make_prompt(ex: Example) -> str:
-                return dataset_loader.build_prompt(ex, tokenizer)
-            
-            def generate_batch(prompts: List[str]) -> List[str]:
-                return [agent.generate(p) for p in prompts]
-        else:
-            use_agent = False
+    if LLMAgent is None:
+        raise ImportError("LLMAgent is required but not available. Please ensure modelloader.llm_agent is importable.")
     
-    if not use_agent:
-        # Use direct backend (original logic)
-        tokenizer, generate_batch, _ = build_generator(args)
-        
-        def make_prompt(ex: Example) -> str:
-            # Try DatasetLoader's build_prompt first
-            prompt = dataset_loader.build_prompt(ex, tokenizer)
-            if prompt:
-                return prompt
-            # Fallback to default_prompt
-            return default_prompt(
-                ex, tokenizer=tokenizer, use_chat_template=args.use_chat_template,
-                include_unanswerable_hint=args.include_unanswerable_hint,
-                handle_unanswerable=args.handle_unanswerable,
-                task_type=task_type
+    # Determine if tools should be enabled
+    use_tools = config.get("use_agent_tools", False)
+    
+    # Build agent from config
+    agent, tokenizer = build_agent_from_args(config, use_tools=use_tools)
+    
+    def make_prompt(ex: Dict[str, Any]) -> str:
+        # Use DatasetLoader's build_prompt
+        prompt = dataset_loader.build_prompt(ex, tokenizer)
+        if prompt:
+            return prompt
+        # Fallback: build simple prompt
+        question = ex.get("question", "")
+        context = ex.get("context", "")
+        if task_type == "extractive":
+            hint = "\nIf the question cannot be answered from the context, reply with: 'unanswerable'." \
+                   if config.get("include_unanswerable_hint") else ""
+            content = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:{hint}\n"
+            if config.get("use_chat_template") and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+                msgs = [{"role":"system","content":"You are a helpful RC assistant."},
+                        {"role":"user","content":content}]
+                return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            return content
+        else:  # math
+            content = (
+                "Solve the following problem. Respond with the final numeric answer only. "
+                "If it is a fraction/percentage, give the numeric form.\n"
+                f"Problem: {question}\nAnswer:"
             )
+            if config.get("use_chat_template") and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+                msgs = [{"role":"system","content":"You are a careful math solver."},
+                        {"role":"user","content":content}]
+                return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            return content
+    
+    def generate_batch(prompts: List[str]) -> List[str]:
+        """Generate responses using LLMAgent"""
+        if use_tools and agent.config.enable_tools:
+            # Use chat mode with tools
+            return [agent.chat(p, use_tools=True) for p in prompts]
+        else:
+            # Use simple generation without tools
+            return [agent.generate(p) for p in prompts]
 
-    bs = max(1, args.batch_size)
-    kept: List[Example] = []
+    bs = max(1, config.get("batch_size", 8))
+    kept: List[Dict[str, Any]] = []
     logs: List[Dict[str, Any]] = []
     answer_comparisons: List[Dict[str, Any]] = []
 
@@ -840,41 +726,44 @@ def run_experiment(_run, _config, _log):
         for j, (ex, pred) in enumerate(zip(batch, preds)):
             # 原始完整输出
             raw_pred = (pred or "").strip()
-            used_prompt = prompts[j] if args.store_prompt else None
+            used_prompt = prompts[j] if config.get("store_prompt") else None
 
             # 默认用于打分的文本
             pred_for_score = raw_pred
 
             # 对自然语言抽取式三套（squadv2 / hotpot / nq），先把短答案抽出来再打分
-            if task_type == "extractive" and args.dataset in ("squadv2", "hotpot", "nq"):
+            dataset_name = config.get("dataset")
+            if task_type == "extractive" and dataset_name in ("squadv2", "hotpot", "nq"):
                 short = extract_qa_answer(raw_pred)
                 if short:
                     pred_for_score = short
             
             # AQuA 使用多选题匹配
-            if args.dataset == "aqua":
+            answers = ex.get("answers", [])
+            if dataset_name == "aqua":
                 # 从 context 中提取 options
                 options = []
-                if ex.context.startswith("Options:"):
-                    options = [line.strip() for line in ex.context.split('\n')[1:] if line.strip()]
-                hit, s1, s2 = match_multiple_choice(pred, ex.answers, options)
-            elif task_type == "extractive" and args.dataset in ("squadv2", "hotpot", "nq"):
+                context = ex.get("context", "")
+                if context.startswith("Options:"):
+                    options = [line.strip() for line in context.split('\n')[1:] if line.strip()]
+                hit, s1, s2 = match_multiple_choice(pred, answers, options)
+            elif task_type == "extractive" and dataset_name in ("squadv2", "hotpot", "nq"):
                 # 自然语言三套用新的判定（judge_easy）
-                hit, s1, s2 = judge_easy(args.dataset, pred_for_score, ex, args)
+                hit, s1, s2 = judge_easy(dataset_name, pred_for_score, ex, config)
 
             elif task_type == "extractive":
                 # 其他将来可能的抽取式数据集，仍走旧的 F1/EM 兜底
-                hit, s1, s2 = match_extractive(pred, ex.answers, args.f1_threshold)
+                hit, s1, s2 = match_extractive(pred, answers, config.get("f1_threshold", 0.8))
             else:
-                hit, s1, s2 = match_math(pred, ex.answers, args.dataset)
+                hit, s1, s2 = match_math(pred, answers, dataset_name)
 
             # 对于 gsm8k 和 math，保存答案对比
-            if args.dataset in ("gsm8k", "math","omini"):
-                pred_extracted = _extract_answer_from_response(pred, args.dataset)
-                gold_extracted = ex.answers[0] if ex.answers else ""
+            if dataset_name in ("gsm8k", "math","omini"):
+                pred_extracted = _extract_answer_from_response(pred, dataset_name)
+                gold_extracted = answers[0] if answers else ""
                 answer_comparisons.append({
-                    "id": ex.id,
-                    "question": ex.question,
+                    "id": ex.get("id"),
+                    "question": ex.get("question", ""),
                     "model_raw_output": pred,
                     "model_extracted_answer": pred_extracted,
                     "gold_raw_answer": gold_extracted,
@@ -885,30 +774,34 @@ def run_experiment(_run, _config, _log):
                 })
 
             is_easy = bool(hit)  # hit = 小模型能答 → 过滤
-            if args.eval_only or not is_easy:
-                if args.store_think:
-                    ex.meta = dict(ex.meta)
-                    ex.meta["model_output"] = raw_pred
-                    ex.meta["model_answer"] = pred_for_score
+            if config.get("eval_only") or not is_easy:
+                if config.get("store_think"):
+                    if "meta" not in ex:
+                        ex["meta"] = {}
+                    ex["meta"]["model_output"] = raw_pred
+                    ex["meta"]["model_answer"] = pred_for_score
 
                 kept.append(ex)
+            question = ex.get("question", "")
             log_item = {
-                "id": ex.id,
-                "dataset": args.dataset,
+                "id": ex.get("id"),
+                "dataset": dataset_name,
                 "is_easy": int(is_easy),
                 "score1": float(s1),
                 "score2": float(s2),
                 "pred": pred_for_score,
-                "answers": ex.answers,
-                "is_unanswerable": bool(getattr(ex, "is_unanswerable", False)),
-                "question": (ex.question[:120] + "...") if len(ex.question) > 120 else ex.question,
+                "answers": answers,
+                "is_unanswerable": bool(ex.get("is_unanswerable", False)),
+                "question": (question[:120] + "...") if len(question) > 120 else question,
             }
-            if args.store_think:
+            if config.get("store_think"):
                 log_item["pred_raw"] = raw_pred
-            if args.store_prompt:
+            if config.get("store_prompt"):
                 log_item["prompt"] = used_prompt
-            if args.store_context and getattr(ex, "context", None):
-                log_item["context_head"] = ex.context[:args.store_context]
+            context = ex.get("context", "")
+            store_context = config.get("store_context", 0)
+            if store_context and context:
+                log_item["context_head"] = context[:store_context]
 
             logs.append(log_item)
     t1 = time()
@@ -920,12 +813,14 @@ def run_experiment(_run, _config, _log):
     wall_time_sec = time() - t_start
 
     # 1) 先做抽样（只对 squadv2/hotpot/nq）
-    if args.dataset in ("squadv2", "hotpot", "nq") and args.sample_size and len(kept) > args.sample_size:
+    dataset_name = config.get("dataset")
+    sample_size = config.get("sample_size")
+    if dataset_name in ("squadv2", "hotpot", "nq") and sample_size and len(kept) > sample_size:
         f1_by_id = {r["id"]: (float(r["score1"]) if r.get("score1") is not None else float("inf"))
                     for r in logs if not r["is_easy"]}
 
-        kept_sorted = sorted(kept, key=lambda ex: f1_by_id.get(ex.id, float("inf")))
-        kept = kept_sorted[:args.sample_size]
+        kept_sorted = sorted(kept, key=lambda ex: f1_by_id.get(ex.get("id"), float("inf")))
+        kept = kept_sorted[:sample_size]
         print(f"[Sample] selected {len(kept)} hardest examples by lowest F1.")
     
     # 2) 再计算统计量（total / hits / accuracy）
@@ -934,12 +829,13 @@ def run_experiment(_run, _config, _log):
     accuracy = hits / total if total else 0.0
     print(f"[Stats] accuracy={accuracy:.4f} ({hits}/{total})")
 
-    if not args.no_logs:
+    if not config.get("no_logs"):
         log_dir = Path("results") / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        tag = f"_{args.run_tag}" if args.run_tag else ""
-        log_path = log_dir / f"{args.dataset}{tag}_{ts}.jsonl"
+        run_tag = config.get("run_tag")
+        tag = f"_{run_tag}" if run_tag else ""
+        log_path = log_dir / f"{dataset_name}{tag}_{ts}.jsonl"
 
         with open(log_path, "w", encoding="utf-8") as f:
             for r in logs:
@@ -951,14 +847,14 @@ def run_experiment(_run, _config, _log):
         print("[Write] skip run logs because --no_logs is set")
 
     # 3) 自然语言三套的 summary
-    if args.dataset in ("squadv2", "hotpot", "nq"):
+    if dataset_name in ("squadv2", "hotpot", "nq"):
         def _avg(vals):
             return float(sum(vals)/len(vals)) if vals else 0.0
 
         f1_all_vals = [float(r["score1"]) for r in logs if r.get("score1") is not None]
         avg_f1_all  = _avg(f1_all_vals)
 
-        kept_ids = {ex.id for ex in kept}
+        kept_ids = {ex.get("id") for ex in kept}
         f1_kept_vals = [float(r["score1"]) for r in logs
                         if (r.get("score1") is not None and r["id"] in kept_ids)]
         avg_f1_kept = _avg(f1_kept_vals)
@@ -969,7 +865,7 @@ def run_experiment(_run, _config, _log):
         summary_dir = Path("results") / "natural_summary"
         summary_dir.mkdir(parents=True, exist_ok=True)
         summary_payload = {
-            "dataset": args.dataset,
+            "dataset": dataset_name,
             "total_examples_before": len(examples),
             "total_examples_after": len(kept),
             "test_time_before_sec": test_time_before_sec,
@@ -982,21 +878,21 @@ def run_experiment(_run, _config, _log):
             "run_wall_time_sec": wall_time_sec,
             "per_example_time_sec": per_example_time,
             "parameters":{
-                "model": args.model,
-                "backend": args.backend,
-                "max_input_tokens": args.max_input_tokens,
-                "max_new_tokens": args.max_new_tokens,
-                "batch_size": args.batch_size,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "f1_threshold": args.f1_threshold,
-                "sample_size": args.sample_size,
-                "seed": args.seed,
+                "model": config.get("model"),
+                "backend": config.get("backend"),
+                "max_input_tokens": config.get("max_input_tokens", 2048),
+                "max_new_tokens": config.get("max_new_tokens", 64),
+                "batch_size": config.get("batch_size", 8),
+                "temperature": config.get("temperature", 0.0),
+                "top_p": config.get("top_p", 1.0),
+                "f1_threshold": config.get("f1_threshold", 0.8),
+                "sample_size": sample_size,
+                "seed": config.get("seed", 42),
             },
         }
-        with open(summary_dir / f"{args.dataset}.json", "w", encoding="utf-8") as f:
+        with open(summary_dir / f"{dataset_name}.json", "w", encoding="utf-8") as f:
             json.dump(summary_payload, f, ensure_ascii=False, indent=2)
-        print(f"[Write] natural summary -> {summary_dir / f'{args.dataset}.json'}")
+        print(f"[Write] natural summary -> {summary_dir / f'{dataset_name}.json'}")
 
     # statistics
     total = len(logs)
@@ -1005,17 +901,17 @@ def run_experiment(_run, _config, _log):
     print(f"[Stats] accuracy={accuracy:.4f} ({hits}/{total})")
 
     # summary export for math datasets
-    if args.dataset in ("aqua", "gsm8k", "math","omini"):
+    if dataset_name in ("aqua", "gsm8k", "math","omini"):
         summary_dir = Path("results") / "math_summary"
         summary_dir.mkdir(parents=True, exist_ok=True)
-        summary_path = summary_dir / f"{args.dataset}.json"
+        summary_path = summary_dir / f"{dataset_name}.json"
 
         test_time_before_sec = eval_time_sec
         accuracy_after = 0.0
         test_time_after_sec_est = per_example_time * len(kept)
 
         summary_payload = {
-            "dataset": args.dataset,
+            "dataset": dataset_name,
             "total_examples_before": len(logs),
             "total_examples_after": len(kept),
             "test_time_before_sec": test_time_before_sec,
@@ -1027,13 +923,13 @@ def run_experiment(_run, _config, _log):
             "run_wall_time_sec": wall_time_sec,
             "per_example_time_sec": per_example_time,
             "parameters":{
-                "model": args.model,
-                "backend": args.backend,
-                "max_input_tokens": args.max_input_tokens,
-                "max_new_tokens": args.max_new_tokens,
-                "batch_size": args.batch_size,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
+                "model": config.get("model"),
+                "backend": config.get("backend"),
+                "max_input_tokens": config.get("max_input_tokens", 2048),
+                "max_new_tokens": config.get("max_new_tokens", 64),
+                "batch_size": config.get("batch_size", 8),
+                "temperature": config.get("temperature", 0.0),
+                "top_p": config.get("top_p", 1.0),
             },
         }
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -1041,30 +937,31 @@ def run_experiment(_run, _config, _log):
         print(f"[Write] summary json -> {summary_path}")
 
     # outputs
-    if not args.eval_only:
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    output_path = config.get("output")
+    if not config.get("eval_only"):
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        if args.dataset == "squadv2" and args.source == "json" and args.input:
-            export_squadv2_original(args.input, args.output, kept)
+        if dataset_name == "squadv2" and config.get("source") == "json" and config.get("input"):
+            export_squadv2_original(config.get("input"), output_path, kept)
         else:
-            write_json(args.output, kept)
+            write_json(output_path, kept)
 
-        print(f"[Write] filtered json -> {args.output}")
+        print(f"[Write] filtered json -> {output_path}")
 
         # 2) 额外：带 think + answer 的 cleaned 数据集
-        if args.store_think:
+        if config.get("store_think"):
             rich_records = []
             for ex in kept:
-                meta = getattr(ex, "meta", {}) or {}
+                meta = ex.get("meta", {})
                 base = meta.get("raw_rec")
 
                 if base is None:
                     base = {
-                        "id": ex.id,
-                        "question": ex.question,
-                        "context": ex.context,
-                        "answers": ex.answers,
-                        "is_unanswerable": bool(getattr(ex, "is_unanswerable", False)),
+                        "id": ex.get("id"),
+                        "question": ex.get("question", ""),
+                        "context": ex.get("context", ""),
+                        "answers": ex.get("answers", []),
+                        "is_unanswerable": bool(ex.get("is_unanswerable", False)),
                     }
                 else:
                     base = _to_native(base)
@@ -1076,27 +973,29 @@ def run_experiment(_run, _config, _log):
 
                 rich_records.append(base)
 
-            rich_dir = Path(args.results_dir) / "filtered_with_model"
+            results_dir = config.get("results_dir", "results")
+            rich_dir = Path(results_dir) / "filtered_with_model"
             rich_dir.mkdir(parents=True, exist_ok=True)
-            rich_path = rich_dir / (Path(args.output).stem + ".with_model.json")
+            rich_path = rich_dir / (Path(output_path).stem + ".with_model.json")
             with open(rich_path, "w", encoding="utf-8") as f:
                 json.dump(rich_records, f, ensure_ascii=False, indent=2)
             print(f"[Write] filtered json with model output -> {rich_path}")
 
-    if args.save_csv and logs:
-        write_csv(args.save_csv, logs)
-        print(f"[Write] decisions csv -> {args.save_csv}")
+    save_csv = config.get("save_csv")
+    if save_csv and logs:
+        write_csv(save_csv, logs)
+        print(f"[Write] decisions csv -> {save_csv}")
 
-    if args.export_squad_like and task_type == "extractive":
-        p = Path(args.output).with_suffix(".squad.json")
+    if config.get("export_squad_like") and task_type == "extractive":
+        p = Path(output_path).with_suffix(".squad.json")
         export_squad_like(str(p), kept)
         print(f"[Write] squad-like json -> {p}")
     
     # 输出答案对比 JSON（仅 gsm8k 和 math）
-    if args.dataset in ("gsm8k", "math","omini") and answer_comparisons:
+    if dataset_name in ("gsm8k", "math","omini") and answer_comparisons:
         comparison_dir = Path("results") / "answer_comparisons"
         comparison_dir.mkdir(parents=True, exist_ok=True)
-        comparison_path = comparison_dir / f"{args.dataset}_comparison.json"
+        comparison_path = comparison_dir / f"{dataset_name}_comparison.json"
         with open(comparison_path, "w", encoding="utf-8") as f:
             json.dump(answer_comparisons, f, ensure_ascii=False, indent=2)
         print(f"[Write] answer comparison json -> {comparison_path}")

@@ -1,0 +1,66 @@
+# Dataset configuration
+dataset: "gsm8k"
+source: "json"
+input_path: null
+split: "validation"
+sample_size: 500
+max_eval_examples: 0
+seed: 42
+store_think: false
+store_prompt: false
+store_context: 0
+run_tag: ""
+decision: "auto"
+squad_f1_threshold: 0.8
+hotpot_f1_threshold: 0.8
+nq_f1_threshold: 0.8
+results_dir: "results"
+save_original: false
+
+# Backend configuration (will be merged with agent config)
+backend: "vllm"
+model: ""
+tokenizer_path: null
+local_files_only: false
+use_chat_template: false
+temperature: 0.0
+top_p: 1.0
+max_input_tokens: 2048
+max_new_tokens: 64
+
+# vLLM
+tp: 1
+gpu_memory_utilization: 0.9
+
+# SGLang
+sglang_api_base: "http://127.0.0.1:30000"  # Can be overridden by SGLANG_API_BASE env var
+sglang_api_key: null  # Can be overridden by SGLANG_API_KEY env var
+sglang_model: null
+concurrency: 8
+
+# Transformers
+device: "cuda"
+device_map: null
+
+# Filtering & outputs
+batch_size: 8
+f1_threshold: 0.8
+export_squad_like: false
+output: ""
+save_csv: null
+no_logs: false
+eval_only: false
+
+# Dataset hints
+include_unanswerable_hint: false
+handle_unanswerable: false
+hotpot_config: "distractor"
+
+# Config file paths
+agent_config_file: null  # Path to agent config YAML (relative to config/agent/)
+use_agent_tools: false  # Whether to use LLMAgent with tools
+
+# Dataset and agent configs (loaded from YAML files)
+dataset_config: {}
+agent_config: {}
+
