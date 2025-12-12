@@ -198,65 +198,7 @@ class DatasetLoader:
             f"Expected adapter module '{self.adapter_module_path}' to define load(args)->List[dict]."
         )
 
-    # ---------- Prompt building ----------
-    def build_prompt(self, ex, tokenizer=None) -> str:
-        """
-        Build a prompt for one Example, 完全由 schema 中的 prompt 字段驱动。
     
-        优先级：
-          1) 若 schema.prompt.user_template 存在，则使用该模板格式化 question/context；
-          2) 否则根据 task_type 使用通用模板。
-        若 prompt.use_chat_template=true 且 tokenizer 支持 apply_chat_template，
-        则使用 system + user 消息构造 chat 格式，否则直接返回纯文本 content。
-        """
-        # 若 adapter 提供了自定义 build_prompt，则优先使用
-        if self._build_prompt_fn is not None:
-            return self._build_prompt_fn(ex, tokenizer)
-
-        pconf = self.config.prompt or {}
-        use_chat_template = bool(pconf.get("use_chat_template", False))
-        # 新 schema 使用 key "system"，旧版本中也可能叫 "system_prompt"
-        system_prompt = pconf.get("system") or pconf.get("system_prompt")
-        user_tmpl = pconf.get("user_template", "")
-
-        q = getattr(ex, "question", "")
-        ctx = getattr(ex, "context", "")
-
-        if user_tmpl:
-            # 使用模板渲染 question / context
-            try:
-                content = user_tmpl.format(question=q, context=ctx)
-            except Exception:
-                # 模板渲染失败时回退为简单模板
-                content = f"Question: {q}\nContext:\n{ctx}\nAnswer:"
-        else:
-            # 简单通用模板（按任务类型区分）
-            if self.config.task_type == "math":
-                content = (
-                    "Solve the following math problem carefully. "
-                    "Provide only the final numeric answer unless otherwise specified.\n\n"
-                    f"Problem: {q}\nAnswer:"
-                )
-            elif self.config.task_type == "extractive":
-                hint = "\nIf the question cannot be answered from the context, reply with: 'unanswerable'."
-                content = f"Context:\n{ctx}\n\nQuestion: {q}\nAnswer:{hint}\n"
-            else:
-                content = f"Question: {q}\nAnswer: "
-
-        if use_chat_template and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
-            msgs = []
-            if system_prompt:
-                msgs.append({"role": "system", "content": system_prompt})
-            msgs.append({"role": "user", "content": content})
-            try:
-                return tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True
-                )
-            except Exception:
-                # Fallback to plain content on any failure
-                pass
-
-        return content
 
     # ---------- Filter rule access ----------
     @property

@@ -15,6 +15,7 @@ import sys
 import collections
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from sacred import Experiment, SETTINGS
 from sacred.observers import FileStorageObserver
 from sacred.utils import apply_backspaces_and_linefeeds
@@ -29,6 +30,28 @@ ex = Experiment("data_cleaning")
 ex.captured_out_filter = apply_backspaces_and_linefeeds
 
 results_path = Path("results")
+
+
+def dict_to_obj(d):
+    """
+    Recursively convert dictionary to object with attribute access.
+    
+    Example:
+        config_dict = {"backend": "vllm", "nested": {"key": "value"}}
+        config_obj = dict_to_obj(config_dict)
+        # Now can use: config_obj.backend, config_obj.nested.key
+    """
+    if isinstance(d, dict):
+        obj = SimpleNamespace()
+        for k, v in d.items():
+            if isinstance(v, dict):
+                setattr(obj, k, dict_to_obj(v))
+            elif isinstance(v, list):
+                setattr(obj, k, [dict_to_obj(item) if isinstance(item, dict) else item for item in v])
+            else:
+                setattr(obj, k, v)
+        return obj
+    return d
 
 
 def _get_config(params, arg_name, subfolder):
@@ -75,6 +98,8 @@ def config_copy(config):
 def main(_run, _config, _log):
     """Sacred main function that calls the experiment runner."""
     config = config_copy(_config)
+    # Convert dict to object with attribute access
+    config = dict_to_obj(config)
     return run_experiment(_run, config, _log)
 
 

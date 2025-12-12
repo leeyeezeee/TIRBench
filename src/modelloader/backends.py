@@ -191,12 +191,66 @@ class RemoteAPIBackend(LLMBackend):
         import os
         if 'gpt' in model_name.lower():
             from openai import OpenAI
-            return type('RemoteLLM', (), {
-                'generate': lambda self, prompts, **kwargs: [
-                    type('Output', (), {'outputs': [type('Out', (), {'text': 'response'})()]})()
-                    for _ in prompts
-                ]
-            })()
+            
+            # Get API key and base URL from environment
+            api_key = os.getenv("OPENAI_API_KEY")
+            base_url = os.getenv("OPENAI_BASE_URL")
+            
+            # Create OpenAI client
+            client_kwargs = {}
+            if api_key:
+                client_kwargs["api_key"] = api_key
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            
+            client = OpenAI(**client_kwargs) if client_kwargs else OpenAI()
+            
+            class RemoteLLM:
+                def __init__(self, client, model_name):
+                    self.client = client
+                    self.model_name = model_name
+                
+                def generate(self, prompts, sampling_params=None):
+                    from dataclasses import dataclass
+                    if sampling_params is None:
+                        @dataclass
+                        class SamplingParams:
+                            max_tokens: int = 2000
+                            temperature: float = 0.7
+                            top_p: float = 0.8
+                        sampling_params = SamplingParams()
+                    
+                    results = []
+                    for prompt in prompts:
+                        try:
+                            # Convert prompt to messages format if needed
+                            if isinstance(prompt, str):
+                                # Try to parse as chat template or use as single message
+                                messages = [{"role": "user", "content": prompt}]
+                            else:
+                                messages = prompt
+                            
+                            response = self.client.chat.completions.create(
+                                model=self.model_name,
+                                messages=messages,
+                                max_tokens=getattr(sampling_params, 'max_tokens', 2000),
+                                temperature=getattr(sampling_params, 'temperature', 0.7),
+                                top_p=getattr(sampling_params, 'top_p', 0.8)
+                            )
+                            
+                            text = response.choices[0].message.content
+                            results.append(type('Output', (), {
+                                'outputs': [type('Out', (), {'text': text})()]
+                            })())
+                        except Exception as e:
+                            # Fallback on error
+                            results.append(type('Output', (), {
+                                'outputs': [type('Out', (), {'text': f'Error: {str(e)}'})()]
+                            })())
+                    
+                    return results
+            
+            return RemoteLLM(client, model_name)
         return None
     
     def generate(self, prompts: List[str], **kwargs) -> List[str]:

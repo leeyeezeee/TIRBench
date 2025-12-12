@@ -24,10 +24,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from dataformator.dataset_loader import DatasetLoader
 try:
-    from modelloader.llm_agent import LLMAgent, AgentConfig
+    from modelloader.llm_agent import LLMAgent
 except ImportError:
     LLMAgent = None
-    AgentConfig = None
 
 
 # =============== Extractive metrics (EM/F1) ===============
@@ -118,13 +117,13 @@ def _judge_squad(pred, ex, config):
     if is_unanswerable or not answers or _norm(answers[0]) in _UNANS:
         hit = _is_unanswerable_pred(pred)
         return hit, 1.0 if hit else 0.0, 1.0 if hit else 0.0
-    thr = config.get('squad_f1_threshold') or config.get('f1_threshold', 0.8)
+    thr = getattr(config, 'squad_f1_threshold', None) or getattr(config, 'f1_threshold', 0.8)
     return match_extractive(pred, answers, thr)
 
 def _judge_hotpot(pred, ex, config):
     # Hotpot：只有答案，不考虑 NoAns
     answers = ex.get("answers", [])
-    thr = config.get('hotpot_f1_threshold') or config.get('f1_threshold', 0.8)
+    thr = getattr(config, 'hotpot_f1_threshold', None) or getattr(config, 'f1_threshold', 0.8)
     return match_extractive(pred, answers, thr)
 
 def _judge_nq(pred, ex, config):
@@ -138,18 +137,18 @@ def _judge_nq(pred, ex, config):
         # 统一成 yes/no 之后做 EM
         hit = (_norm(pred) in {"yes", "no"} and _norm(pred) in {_norm(a) for a in answers})
         return hit, 1.0 if hit else 0.0, 1.0 if hit else 0.0
-    thr = config.get('nq_f1_threshold') or config.get('f1_threshold', 0.8)
+    thr = getattr(config, 'nq_f1_threshold', None) or getattr(config, 'f1_threshold', 0.8)
     return match_extractive(pred, answers, thr)
 
 def judge_easy(dataset: str, pred: str, ex, config):
     """按数据集返回 (hit, f1, em)"""
     answers = ex.get("answers", [])
-    decision = config.get('decision', 'auto')
+    decision = getattr(config, 'decision', 'auto')
     if decision == "em":
         em = float(_norm(pred) in {_norm(a) for a in (answers or [])})
         return (em >= 1.0), 0.0, em
     if decision == "f1":
-        return match_extractive(pred, answers, config.get('f1_threshold', 0.8))
+        return match_extractive(pred, answers, getattr(config, 'f1_threshold', 0.8))
 
     # auto：按数据集走合适规则
     if decision in ("auto","squad_v2") and dataset == "squadv2":
@@ -159,7 +158,7 @@ def judge_easy(dataset: str, pred: str, ex, config):
     if decision in ("auto","nq") and dataset == "nq":
         return _judge_nq(pred, ex, config)
 
-    return match_extractive(pred, answers, config.get('f1_threshold', 0.8))
+    return match_extractive(pred, answers, getattr(config, 'f1_threshold', 0.8))
 
 # =============== Math metrics ===============
 _BOXED = re.compile(r"\\boxed\{([^}]*)\}")
@@ -438,88 +437,22 @@ def match_multiple_choice(pred: str, golds: List[str], options: List[str] = None
     return False, 1.0, 0.0
 
 # =============== LLM Agent Helper ===============
-def build_agent_from_args(config: Dict[str, Any], use_tools: bool = False) -> Tuple[LLMAgent, Any]:
+def build_agent_from_args(config, use_tools: bool = False) -> Tuple[LLMAgent, Any]:
     """
-    Build LLMAgent from config dictionary.
+    Build LLMAgent from config object.
     
     Args:
-        config: Configuration dictionary (from Sacred _config)
+        config: Configuration object (from Sacred _config, converted to object with attribute access)
         use_tools: Whether to enable tools (if False, tools are disabled even if configured)
     
     Returns:
         Tuple of (LLMAgent instance, tokenizer)
     """
-    if LLMAgent is None or AgentConfig is None:
+    if LLMAgent is None:
         raise ImportError("LLMAgent is not available. Please ensure modelloader.llm_agent is importable.")
     
-    # Get agent_config dict for nested access
-    agent_config_dict = config.get('agent_config', {}) or {}
-    if not isinstance(agent_config_dict, dict):
-        agent_config_dict = {}
-    
-    # Handle backend-specific configs
-    backend = config.get('backend', 'vllm')
-    vllm_config = agent_config_dict.get('vllm', {})
-    transformers_config = agent_config_dict.get('transformers', {})
-    sglang_config = agent_config_dict.get('sglang', {})
-    
-    # Handle tool configs
-    tools_config = agent_config_dict.get('tools', {})
-    code_config = tools_config.get('code', {})
-    search_config = tools_config.get('search', {})
-    mind_map_config = tools_config.get('mind_map', {})
-    
-    # Handle tool calling config
-    tool_calling_config = agent_config_dict.get('tool_calling', {})
-    
-    # Handle generation config
-    generation_config = agent_config_dict.get('generation', {})
-    
-    # Get model path - prefer from agent_config, fallback to top-level
-    model_path = agent_config_dict.get('model_path') or config.get('model', '')
-    tokenizer_path = agent_config_dict.get('tokenizer_path') or config.get('tokenizer_path')
-    
-    # Handle sglang model name
-    if backend == 'sglang':
-        model_path = config.get('sglang_model') or model_path
-    
-    # Build AgentConfig from config
-    agent_config = AgentConfig(
-        backend=backend,
-        model_path=model_path,
-        tokenizer_path=tokenizer_path,
-        remote_model=agent_config_dict.get('remote_model') or config.get('remote_model'),
-        
-        # Backend-specific
-        tensor_parallel_size=vllm_config.get('tensor_parallel_size', config.get('tp', 1)),
-        gpu_memory_utilization=vllm_config.get('gpu_memory_utilization', config.get('gpu_memory_utilization', 0.9)),
-        device=transformers_config.get('device', config.get('device', 'cuda')),
-        device_map=transformers_config.get('device_map') or config.get('device_map'),
-        api_base=sglang_config.get('api_base') or config.get('sglang_api_base'),
-        api_key=sglang_config.get('api_key') or config.get('sglang_api_key'),
-        
-        # Generation - prefer from generation config, fallback to top-level
-        temperature=generation_config.get('temperature', config.get('temperature', 0.7)),
-        top_p=generation_config.get('top_p', config.get('top_p', 1.0)),
-        max_tokens=generation_config.get('max_tokens', config.get('max_input_tokens', 2048)),
-        max_new_tokens=generation_config.get('max_new_tokens', config.get('max_new_tokens', 2048)),
-        
-        # Tools
-        enable_tools=use_tools and tools_config.get('enabled', False),
-        tools=tools_config.get('available', []) if use_tools else [],
-        code_model=code_config.get('model'),
-        bing_subscription_key=search_config.get('bing_subscription_key'),
-        bing_endpoint=search_config.get('bing_endpoint'),
-        mind_map_dir=mind_map_config.get('working_dir', './local_mem'),
-        
-        # Tool calling
-        tool_call_format=tool_calling_config.get('format', 'json'),
-        max_tool_iterations=tool_calling_config.get('max_iterations', 5),
-        system_prompt=agent_config_dict.get('system_prompt'),
-    )
-    
-    # Build agent from AgentConfig
-    agent = LLMAgent(agent_config)
+    # Build agent directly from config object
+    agent = LLMAgent(config)
     
     return agent, agent.tokenizer
 
@@ -611,65 +544,77 @@ def run_experiment(_run, _config, _log):
     Main experiment logic.
     This function contains all the core execution logic for data cleaning experiments.
     """
-    # Use _config directly (already merged in main.py)
+    # Use _config directly (already merged and converted to object in main.py)
     config = _config
     
     # Handle input_path vs input
-    if config.get("input_path") and not config.get("input"):
-        config["input"] = config["input_path"]
+    input_path = getattr(config, "input_path", None)
+    input_val = getattr(config, "input", None)
+    if input_path and not input_val:
+        config.input = input_path
     
     # Merge dataset config if present
-    dataset_config = config.get("dataset_config", {})
+    dataset_config = getattr(config, "dataset_config", None)
     if dataset_config:
-        if dataset_config.get("default_source") and not config.get("source"):
-            config["source"] = dataset_config["default_source"]
-        if dataset_config.get("default_input") and not config.get("input"):
-            config["input"] = os.path.expandvars(dataset_config["default_input"])
+        default_source = getattr(dataset_config, "default_source", None)
+        default_input = getattr(dataset_config, "default_input", None)
+        if default_source and not getattr(config, "source", None):
+            config.source = default_source
+        if default_input and not getattr(config, "input", None):
+            config.input = os.path.expandvars(default_input)
     
     # Validate required parameters
-    if not config.get("dataset"):
+    if not getattr(config, "dataset", None):
         raise ValueError("dataset is required")
-    if not config.get("model"):
+    if not getattr(config, "model", None):
         raise ValueError("model is required")
-    if not config.get("output"):
+    if not getattr(config, "output", None):
         raise ValueError("output is required")
     
     # Log configuration to Sacred
-    _run.log_scalar("config.dataset", config.get("dataset"))
-    _run.log_scalar("config.backend", config.get("backend"))
-    _run.log_scalar("config.model", config.get("model"))
+    _run.log_scalar("config.dataset", getattr(config, "dataset", None))
+    _run.log_scalar("config.backend", getattr(config, "backend", None))
+    _run.log_scalar("config.model", getattr(config, "model", None))
 
     # 全局运行时间（加载+推理+写结果）
     t_start = time()
     start_iso = datetime.now().isoformat(timespec="seconds")
 
     # 给这次 run 建一个目录
-    run_id = config.get("run_tag") or f"{config.get('dataset')}__{datetime.now():%y%m%d_%H%M%S}"
-    run_dir = Path(config.get("results_dir", "results")) / "runs" / run_id
+    run_tag = getattr(config, "run_tag", None)
+    dataset = getattr(config, "dataset", None)
+    run_id = run_tag or f"{dataset}__{datetime.now():%y%m%d_%H%M%S}"
+    run_dir = Path(getattr(config, "results_dir", "results")) / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # load data using DatasetLoader
-    print(f"[Load] dataset={config.get('dataset')} source={config.get('source')} split={config.get('split')} input={config.get('input')}")
-    dataset_loader = DatasetLoader(config.get("dataset"))
+    source = getattr(config, "source", None)
+    split = getattr(config, "split", None)
+    input_val = getattr(config, "input", None)
+    print(f"[Load] dataset={dataset} source={source} split={split} input={input_val}")
+    dataset_loader = DatasetLoader(dataset)
     examples = dataset_loader.load(config)
     print(f"[Load] {len(examples)} examples")
 
-    task_type = "extractive" if config.get("dataset") in ("squadv2","hotpot","nq") else "math"
+    task_type = "extractive" if dataset in ("squadv2","hotpot","nq") else "math"
 
-    max_eval_examples = config.get("max_eval_examples", 0)
+    max_eval_examples = getattr(config, "max_eval_examples", 0)
     if max_eval_examples and max_eval_examples > 0 and len(examples) > max_eval_examples:
-        random.seed(config.get("seed", 42))
+        seed = getattr(config, "seed", 42)
+        random.seed(seed)
         examples = random.sample(examples, max_eval_examples)
-        print(f"[Debug] Only evaluate {len(examples)} examples (random subset, seed={config.get('seed', 42)})")
+        print(f"[Debug] Only evaluate {len(examples)} examples (random subset, seed={seed})")
 
     # backend - always use LLMAgent (with or without tools)
-    print(f"[Init] backend={config.get('backend')} model={config.get('model')}")
+    backend = getattr(config, "backend", None)
+    model = getattr(config, "model", None)
+    print(f"[Init] backend={backend} model={model}")
     
     if LLMAgent is None:
         raise ImportError("LLMAgent is required but not available. Please ensure modelloader.llm_agent is importable.")
     
     # Determine if tools should be enabled
-    use_tools = config.get("use_agent_tools", False)
+    use_tools = getattr(config, "use_agent_tools", False)
     
     # Build agent from config
     agent, tokenizer = build_agent_from_args(config, use_tools=use_tools)
@@ -684,9 +629,9 @@ def run_experiment(_run, _config, _log):
         context = ex.get("context", "")
         if task_type == "extractive":
             hint = "\nIf the question cannot be answered from the context, reply with: 'unanswerable'." \
-                   if config.get("include_unanswerable_hint") else ""
+                   if getattr(config, "include_unanswerable_hint", False) else ""
             content = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:{hint}\n"
-            if config.get("use_chat_template") and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            if getattr(config, "use_chat_template", False) and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
                 msgs = [{"role":"system","content":"You are a helpful RC assistant."},
                         {"role":"user","content":content}]
                 return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
@@ -697,7 +642,7 @@ def run_experiment(_run, _config, _log):
                 "If it is a fraction/percentage, give the numeric form.\n"
                 f"Problem: {question}\nAnswer:"
             )
-            if config.get("use_chat_template") and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            if getattr(config, "use_chat_template", False) and tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
                 msgs = [{"role":"system","content":"You are a careful math solver."},
                         {"role":"user","content":content}]
                 return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
@@ -705,14 +650,14 @@ def run_experiment(_run, _config, _log):
     
     def generate_batch(prompts: List[str]) -> List[str]:
         """Generate responses using LLMAgent"""
-        if use_tools and agent.config.enable_tools:
+        if use_tools:
             # Use chat mode with tools
             return [agent.chat(p, use_tools=True) for p in prompts]
         else:
             # Use simple generation without tools
             return [agent.generate(p) for p in prompts]
 
-    bs = max(1, config.get("batch_size", 8))
+    bs = max(1, getattr(config, "batch_size", 8))
     kept: List[Dict[str, Any]] = []
     logs: List[Dict[str, Any]] = []
     answer_comparisons: List[Dict[str, Any]] = []
@@ -726,13 +671,13 @@ def run_experiment(_run, _config, _log):
         for j, (ex, pred) in enumerate(zip(batch, preds)):
             # 原始完整输出
             raw_pred = (pred or "").strip()
-            used_prompt = prompts[j] if config.get("store_prompt") else None
+            used_prompt = prompts[j] if getattr(config, "store_prompt", False) else None
 
             # 默认用于打分的文本
             pred_for_score = raw_pred
 
             # 对自然语言抽取式三套（squadv2 / hotpot / nq），先把短答案抽出来再打分
-            dataset_name = config.get("dataset")
+            dataset_name = dataset
             if task_type == "extractive" and dataset_name in ("squadv2", "hotpot", "nq"):
                 short = extract_qa_answer(raw_pred)
                 if short:
@@ -753,7 +698,7 @@ def run_experiment(_run, _config, _log):
 
             elif task_type == "extractive":
                 # 其他将来可能的抽取式数据集，仍走旧的 F1/EM 兜底
-                hit, s1, s2 = match_extractive(pred, answers, config.get("f1_threshold", 0.8))
+                hit, s1, s2 = match_extractive(pred, answers, getattr(config, "f1_threshold", 0.8))
             else:
                 hit, s1, s2 = match_math(pred, answers, dataset_name)
 
@@ -774,8 +719,8 @@ def run_experiment(_run, _config, _log):
                 })
 
             is_easy = bool(hit)  # hit = 小模型能答 → 过滤
-            if config.get("eval_only") or not is_easy:
-                if config.get("store_think"):
+            if getattr(config, "eval_only", False) or not is_easy:
+                if getattr(config, "store_think", False):
                     if "meta" not in ex:
                         ex["meta"] = {}
                     ex["meta"]["model_output"] = raw_pred
@@ -794,12 +739,12 @@ def run_experiment(_run, _config, _log):
                 "is_unanswerable": bool(ex.get("is_unanswerable", False)),
                 "question": (question[:120] + "...") if len(question) > 120 else question,
             }
-            if config.get("store_think"):
+            if getattr(config, "store_think", False):
                 log_item["pred_raw"] = raw_pred
-            if config.get("store_prompt"):
+            if getattr(config, "store_prompt", False):
                 log_item["prompt"] = used_prompt
             context = ex.get("context", "")
-            store_context = config.get("store_context", 0)
+            store_context = getattr(config, "store_context", 0)
             if store_context and context:
                 log_item["context_head"] = context[:store_context]
 
@@ -813,8 +758,7 @@ def run_experiment(_run, _config, _log):
     wall_time_sec = time() - t_start
 
     # 1) 先做抽样（只对 squadv2/hotpot/nq）
-    dataset_name = config.get("dataset")
-    sample_size = config.get("sample_size")
+    sample_size = getattr(config, "sample_size", None)
     if dataset_name in ("squadv2", "hotpot", "nq") and sample_size and len(kept) > sample_size:
         f1_by_id = {r["id"]: (float(r["score1"]) if r.get("score1") is not None else float("inf"))
                     for r in logs if not r["is_easy"]}
@@ -829,11 +773,11 @@ def run_experiment(_run, _config, _log):
     accuracy = hits / total if total else 0.0
     print(f"[Stats] accuracy={accuracy:.4f} ({hits}/{total})")
 
-    if not config.get("no_logs"):
+    if not getattr(config, "no_logs", False):
         log_dir = Path("results") / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_tag = config.get("run_tag")
+        run_tag = getattr(config, "run_tag", None)
         tag = f"_{run_tag}" if run_tag else ""
         log_path = log_dir / f"{dataset_name}{tag}_{ts}.jsonl"
 
@@ -878,16 +822,16 @@ def run_experiment(_run, _config, _log):
             "run_wall_time_sec": wall_time_sec,
             "per_example_time_sec": per_example_time,
             "parameters":{
-                "model": config.get("model"),
-                "backend": config.get("backend"),
-                "max_input_tokens": config.get("max_input_tokens", 2048),
-                "max_new_tokens": config.get("max_new_tokens", 64),
-                "batch_size": config.get("batch_size", 8),
-                "temperature": config.get("temperature", 0.0),
-                "top_p": config.get("top_p", 1.0),
-                "f1_threshold": config.get("f1_threshold", 0.8),
+                "model": getattr(config, "model", None),
+                "backend": getattr(config, "backend", None),
+                "max_input_tokens": getattr(config, "max_input_tokens", 2048),
+                "max_new_tokens": getattr(config, "max_new_tokens", 64),
+                "batch_size": getattr(config, "batch_size", 8),
+                "temperature": getattr(config, "temperature", 0.0),
+                "top_p": getattr(config, "top_p", 1.0),
+                "f1_threshold": getattr(config, "f1_threshold", 0.8),
                 "sample_size": sample_size,
-                "seed": config.get("seed", 42),
+                "seed": getattr(config, "seed", 42),
             },
         }
         with open(summary_dir / f"{dataset_name}.json", "w", encoding="utf-8") as f:
@@ -923,13 +867,13 @@ def run_experiment(_run, _config, _log):
             "run_wall_time_sec": wall_time_sec,
             "per_example_time_sec": per_example_time,
             "parameters":{
-                "model": config.get("model"),
-                "backend": config.get("backend"),
-                "max_input_tokens": config.get("max_input_tokens", 2048),
-                "max_new_tokens": config.get("max_new_tokens", 64),
-                "batch_size": config.get("batch_size", 8),
-                "temperature": config.get("temperature", 0.0),
-                "top_p": config.get("top_p", 1.0),
+                "model": getattr(config, "model", None),
+                "backend": getattr(config, "backend", None),
+                "max_input_tokens": getattr(config, "max_input_tokens", 2048),
+                "max_new_tokens": getattr(config, "max_new_tokens", 64),
+                "batch_size": getattr(config, "batch_size", 8),
+                "temperature": getattr(config, "temperature", 0.0),
+                "top_p": getattr(config, "top_p", 1.0),
             },
         }
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -937,19 +881,21 @@ def run_experiment(_run, _config, _log):
         print(f"[Write] summary json -> {summary_path}")
 
     # outputs
-    output_path = config.get("output")
-    if not config.get("eval_only"):
+    output_path = getattr(config, "output", None)
+    if not getattr(config, "eval_only", False):
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        if dataset_name == "squadv2" and config.get("source") == "json" and config.get("input"):
-            export_squadv2_original(config.get("input"), output_path, kept)
+        source_val = getattr(config, "source", None)
+        input_val = getattr(config, "input", None)
+        if dataset_name == "squadv2" and source_val == "json" and input_val:
+            export_squadv2_original(input_val, output_path, kept)
         else:
             write_json(output_path, kept)
 
         print(f"[Write] filtered json -> {output_path}")
 
         # 2) 额外：带 think + answer 的 cleaned 数据集
-        if config.get("store_think"):
+        if getattr(config, "store_think", False):
             rich_records = []
             for ex in kept:
                 meta = ex.get("meta", {})
@@ -973,7 +919,7 @@ def run_experiment(_run, _config, _log):
 
                 rich_records.append(base)
 
-            results_dir = config.get("results_dir", "results")
+            results_dir = getattr(config, "results_dir", "results")
             rich_dir = Path(results_dir) / "filtered_with_model"
             rich_dir.mkdir(parents=True, exist_ok=True)
             rich_path = rich_dir / (Path(output_path).stem + ".with_model.json")
@@ -981,12 +927,12 @@ def run_experiment(_run, _config, _log):
                 json.dump(rich_records, f, ensure_ascii=False, indent=2)
             print(f"[Write] filtered json with model output -> {rich_path}")
 
-    save_csv = config.get("save_csv")
+    save_csv = getattr(config, "save_csv", None)
     if save_csv and logs:
         write_csv(save_csv, logs)
         print(f"[Write] decisions csv -> {save_csv}")
 
-    if config.get("export_squad_like") and task_type == "extractive":
+    if getattr(config, "export_squad_like", False) and task_type == "extractive":
         p = Path(output_path).with_suffix(".squad.json")
         export_squad_like(str(p), kept)
         print(f"[Write] squad-like json -> {p}")

@@ -14,7 +14,6 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Tuple
-from dataclasses import dataclass, field
 
 # Import tools and backends from separate modules
 from modelloader.tools import Tool, CodeAgentTool, SearchAgentTool, MindMapTool
@@ -87,48 +86,6 @@ class ToolCallParser:
 
 
 # =============== Main Agent Class ===============
-@dataclass
-class AgentConfig:
-    """Configuration for LLM Agent"""
-    backend: str = "vllm"  # vllm, sglang, transformers, remote_api
-    model_path: str = ""
-    tokenizer_path: Optional[str] = None
-    
-    # Backend-specific
-    tensor_parallel_size: int = 1
-    gpu_memory_utilization: float = 0.9
-    device: str = "cuda"
-    device_map: Optional[str] = None
-    
-    # API config
-    api_base: Optional[str] = None
-    api_key: Optional[str] = None
-    remote_model: Optional[str] = None  # gpt-4o, claude-3.5-sonnet, etc.
-    
-    # Generation params
-    temperature: float = 0.7
-    top_p: float = 1.0
-    max_tokens: int = 2048
-    max_new_tokens: int = 2048
-    
-    # Tool config
-    enable_tools: bool = True
-    tools: List[str] = field(default_factory=lambda: [])  # ["code", "search", "mind_map"]
-    
-    # Tool-specific
-    code_model: Optional[str] = None
-    bing_subscription_key: Optional[str] = None
-    bing_endpoint: Optional[str] = None
-    mind_map_dir: str = "./local_mem"
-    
-    # Tool call parsing
-    tool_call_format: str = "json"  # json, function_call, auto
-    max_tool_iterations: int = 5
-    
-    # Optional system prompt
-    system_prompt: Optional[str] = None
-
-
 class LLMAgent:
     """
     LLM Agent with optional tool calling capabilities.
@@ -136,78 +93,120 @@ class LLMAgent:
     Supports multiple backends and can work with or without tools.
     
     Example:
-        # Direct initialization from AgentConfig
-        config = AgentConfig(backend="vllm", model_path="/path/to/model")
+        # Direct initialization from config dictionary
+        config = {"backend": "vllm", "model": "/path/to/model", ...}
         agent = LLMAgent(config)
     """
     
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize LLMAgent from configuration dictionary.
+        
+        Args:
+            config: Configuration dictionary containing all agent settings.
+                   Should include backend, model, tools, etc. as loaded by main.py
+        """
         self.config = config
         self.backend = self._init_backend()
         self.tokenizer = self.backend.get_tokenizer()
         self.tools: Dict[str, Tool] = {}
         self.conversation_history: List[Dict[str, str]] = []
-        self.system_prompt = getattr(config, 'system_prompt', None)
+        
+        # Get agent_config for nested access
+        agent_config = getattr(config, 'agent_config', None)
+        
+        self.system_prompt = getattr(agent_config, 'system_prompt', None) or getattr(config, 'system_prompt', None)
         
         # Initialize tools if enabled
-        if config.enable_tools:
+        tools_config = getattr(agent_config, 'tools', None)
+        enable_tools = getattr(config, 'use_agent_tools', False) and getattr(tools_config, 'enabled', False)
+        if enable_tools:
             self._init_tools()
     
     
     def _init_backend(self) -> LLMBackend:
         """Initialize the appropriate backend"""
-        if self.config.backend == "vllm":
+        backend = getattr(self.config, 'backend', 'vllm')
+        agent_config = getattr(self.config, 'agent_config', None)
+        
+        # Get model path - prefer from agent_config, fallback to top-level
+        model_path = getattr(agent_config, 'model_path', None) or getattr(self.config, 'model', '')
+        tokenizer_path = getattr(agent_config, 'tokenizer_path', None) or getattr(self.config, 'tokenizer_path', None)
+        remote_model = getattr(agent_config, 'remote_model', None) or getattr(self.config, 'remote_model', None)
+        
+        # Handle sglang model name
+        if backend == 'sglang':
+            model_path = getattr(self.config, 'sglang_model', None) or model_path
+        
+        # Get backend-specific configs
+        vllm_config = getattr(agent_config, 'vllm', None)
+        transformers_config = getattr(agent_config, 'transformers', None)
+        sglang_config = getattr(agent_config, 'sglang', None)
+        generation_config = getattr(agent_config, 'generation', None)
+        
+        if backend == "vllm":
             return VLLMBackend(
-                model_path=self.config.model_path or self.config.remote_model,
-                tokenizer_path=self.config.tokenizer_path,
-                tensor_parallel_size=self.config.tensor_parallel_size,
-                gpu_memory_utilization=self.config.gpu_memory_utilization,
+                model_path=model_path or remote_model,
+                tokenizer_path=tokenizer_path,
+                tensor_parallel_size=getattr(vllm_config, 'tensor_parallel_size', None) or getattr(self.config, 'tp', 1),
+                gpu_memory_utilization=getattr(vllm_config, 'gpu_memory_utilization', None) or getattr(self.config, 'gpu_memory_utilization', 0.9),
                 sampling_params={
-                    "temperature": self.config.temperature,
-                    "top_p": self.config.top_p,
-                    "max_tokens": self.config.max_tokens
+                    "temperature": getattr(generation_config, 'temperature', None) or getattr(self.config, 'temperature', 0.7),
+                    "top_p": getattr(generation_config, 'top_p', None) or getattr(self.config, 'top_p', 1.0),
+                    "max_tokens": getattr(generation_config, 'max_tokens', None) or getattr(self.config, 'max_input_tokens', 2048)
                 }
             )
-        elif self.config.backend == "sglang":
-            api_base = self.config.api_base or os.getenv("SGLANG_API_BASE", "http://127.0.0.1:30000")
+        elif backend == "sglang":
+            api_base = getattr(sglang_config, 'api_base', None) or getattr(self.config, 'sglang_api_base', None) or os.getenv("SGLANG_API_BASE", "http://127.0.0.1:30000")
             return SGLangBackend(
                 api_base=api_base,
-                model=self.config.model_path or self.config.remote_model,
-                api_key=self.config.api_key or os.getenv("SGLANG_API_KEY")
+                model=model_path or remote_model,
+                api_key=getattr(sglang_config, 'api_key', None) or getattr(self.config, 'sglang_api_key', None) or os.getenv("SGLANG_API_KEY")
             )
-        elif self.config.backend == "transformers":
+        elif backend == "transformers":
             return TransformersBackend(
-                model_path=self.config.model_path,
-                device=self.config.device,
-                device_map=self.config.device_map
+                model_path=model_path,
+                device=getattr(transformers_config, 'device', None) or getattr(self.config, 'device', 'cuda'),
+                device_map=getattr(transformers_config, 'device_map', None) or getattr(self.config, 'device_map', None)
             )
-        elif self.config.backend == "remote_api":
-            if not self.config.remote_model:
+        elif backend == "remote_api":
+            if not remote_model:
                 raise ValueError("remote_model must be specified for remote_api backend")
-            return RemoteAPIBackend(model_name=self.config.remote_model)
+            return RemoteAPIBackend(model_name=remote_model)
         else:
-            raise ValueError(f"Unknown backend: {self.config.backend}")
+            raise ValueError(f"Unknown backend: {backend}")
     
     def _init_tools(self):
         """Initialize available tools"""
-        tools_to_load = self.config.tools if self.config.tools else ["code", "search", "mind_map"]
+        agent_config = getattr(self.config, 'agent_config', None)
+        
+        tools_config = getattr(agent_config, 'tools', None)
+        tools_to_load = getattr(tools_config, 'available', None)
+        if not tools_to_load:
+            tools_to_load = ["code", "search", "mind_map"]
+        
+        code_config = getattr(tools_config, 'code', None)
+        search_config = getattr(tools_config, 'search', None)
+        mind_map_config = getattr(tools_config, 'mind_map', None)
         
         for tool_name in tools_to_load:
             if tool_name == "code":
                 self.tools["code_agent"] = CodeAgentTool(
-                    model_name=self.config.code_model,
+                    model_name=getattr(code_config, 'model', None),
                     working_dir="./tmp"
                 )
             elif tool_name == "search":
-                if self.config.bing_subscription_key and self.config.bing_endpoint:
+                bing_key = getattr(search_config, 'bing_subscription_key', None)
+                bing_endpoint = getattr(search_config, 'bing_endpoint', None)
+                if bing_key and bing_endpoint:
                     self.tools["search_agent"] = SearchAgentTool(
-                        bing_subscription_key=self.config.bing_subscription_key,
-                        bing_endpoint=self.config.bing_endpoint,
+                        bing_subscription_key=bing_key,
+                        bing_endpoint=bing_endpoint,
                         top_k=10
                     )
             elif tool_name == "mind_map":
                 self.tools["mind_map"] = MindMapTool(
-                    working_dir=self.config.mind_map_dir
+                    working_dir=getattr(mind_map_config, 'working_dir', './local_mem')
                 )
     
     def _build_tool_prompt(self) -> str:
@@ -240,52 +239,62 @@ class LLMAgent:
     
     def build_prompt_with_dataset(
         self,
-        example: Dict[str, Any],
-        dataset_loader: Any,
         use_tools: Optional[bool] = None,
         system_prompt: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """
-        Build messages that integrate dataset-specific formatting with tool capabilities.
+        Build messages that integrate dataset-specific prompt with tool capabilities.
         
-        This method combines:
-        1. Dataset-specific prompt from dataset_loader.build_prompt
-        2. Tool descriptions (if tools are enabled)
+        This method:
+        1. First adds tool descriptions (if tools are enabled)
+        2. Then adds dataset-specific prompt from config
+        
+        The dataset prompt is loaded directly from config, no template filling is needed.
         
         Args:
-            example: Example dict with 'question', 'context', etc.
-            dataset_loader: DatasetLoader instance for dataset-specific prompt building
-            use_tools: Whether to include tool descriptions (defaults to config.enable_tools)
+            use_tools: Whether to include tool descriptions (defaults to config.use_agent_tools)
             system_prompt: Optional system prompt to override config default
         
         Returns:
             List of message dicts with 'role' and 'content' keys
         """
-        use_tools = use_tools if use_tools is not None else self.config.enable_tools
+        agent_config = getattr(self.config, 'agent_config', None)
+        tools_config = getattr(agent_config, 'tools', None)
+        enable_tools = getattr(self.config, 'use_agent_tools', False) and getattr(tools_config, 'enabled', False)
+        use_tools = use_tools if use_tools is not None else enable_tools
         
-        # Step 1: Get base prompt from dataset_loader.build_prompt
-        base_prompt = dataset_loader.build_prompt(example, self.tokenizer)
+        # Step 1: Get prompt config from dataset_config
+        dataset_config = getattr(self.config, "dataset_config", None)
+        prompt_config = getattr(dataset_config, "prompt", None)
         
-        # Step 2: Build system prompt with tool descriptions if needed
-        system_content = system_prompt or self.system_prompt or ""
+        # Extract prompt settings from config
+        dataset_system = getattr(prompt_config, "system", None) or getattr(prompt_config, "system_prompt", None)
+        user_content = getattr(prompt_config, "user_template", "") or getattr(prompt_config, "user", "")
         
+        # Step 2: Build system prompt - first add tools, then add dataset system prompt
+        system_content = system_prompt or ""
+        
+        # Add tool descriptions first (if tools are enabled)
         if use_tools and self.tools:
             tool_prompt = self._build_tool_prompt()
             if system_content:
                 system_content = system_content + "\n" + tool_prompt
             else:
-                # Default system prompt when tools are enabled
-                system_content = (
-                    "You are a helpful assistant that can use tools to solve problems. "
-                    "Use tools when needed, but always provide a clear final answer.\n"
-                    + tool_prompt
-                )
+                system_content = tool_prompt
+        
+        # Then add dataset-specific system prompt
+        if dataset_system:
+            if system_content:
+                system_content = system_content + "\n" + dataset_system
+            else:
+                system_content = dataset_system
         
         # Step 3: Build messages structure
         messages = []
         if system_content:
             messages.append({"role": "system", "content": system_content})
-        messages.append({"role": "user", "content": base_prompt})
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
         
         return messages
     
@@ -311,10 +320,13 @@ class LLMAgent:
     def _parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
         """Parse tool calls from model output"""
         parser = ToolCallParser()
+        agent_config = getattr(self.config, 'agent_config', None)
+        tool_calling_config = getattr(agent_config, 'tool_calling', None)
+        tool_call_format = getattr(tool_calling_config, 'format', 'json')
         
-        if self.config.tool_call_format == "json":
+        if tool_call_format == "json":
             return parser.parse_json_tool_calls(text)
-        elif self.config.tool_call_format == "function_call":
+        elif tool_call_format == "function_call":
             return parser.parse_function_call_format(text)
         else:  # auto
             json_calls = parser.parse_json_tool_calls(text)
@@ -340,32 +352,35 @@ class LLMAgent:
         system_prompt: Optional[str] = None,
         use_tools: Optional[bool] = None,
         max_iterations: Optional[int] = None,
-        dataset_loader: Any = None,
         example: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         Chat with the agent, optionally using tools and dataset-specific prompts.
         
         Args:
-            message: User message (ignored if dataset_loader and example are provided)
+            message: User message (ignored if example is provided)
             system_prompt: Optional system prompt (overrides config default)
             use_tools: Whether to use tools (overrides config)
             max_iterations: Maximum tool call iterations (overrides config)
-            dataset_loader: Optional DatasetLoader for dataset-specific prompt building
-            example: Optional example dict (used with dataset_loader to build prompt)
+            example: Optional example dict (used with dataset config to build prompt)
         
         Returns:
             Final response string
         """
-        use_tools = use_tools if use_tools is not None else self.config.enable_tools
-        max_iterations = max_iterations or self.config.max_tool_iterations
+        agent_config = getattr(self.config, 'agent_config', None)
+        tools_config = getattr(agent_config, 'tools', None)
+        tool_calling_config = getattr(agent_config, 'tool_calling', None)
+        generation_config = getattr(agent_config, 'generation', None)
         
-        # Build initial messages - unified approach
-        if dataset_loader and example:
-            # Use dataset-specific prompt building
+        enable_tools = getattr(self.config, 'use_agent_tools', False) and getattr(tools_config, 'enabled', False)
+        use_tools = use_tools if use_tools is not None else enable_tools
+        max_iterations = max_iterations or getattr(tool_calling_config, 'max_iterations', 5)
+        
+        # Build initial messages
+        dataset_config = getattr(self.config, "dataset_config", None)
+        if dataset_config:
+            # Use dataset-specific prompt building from config
             messages = self.build_prompt_with_dataset(
-                example=example,
-                dataset_loader=dataset_loader,
                 use_tools=use_tools,
                 system_prompt=system_prompt
             )
@@ -395,10 +410,10 @@ class LLMAgent:
             prompt = self._apply_chat_template(messages)
             response = self.backend.generate(
                 [prompt],
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                max_tokens=self.config.max_tokens,
-                max_new_tokens=self.config.max_new_tokens
+                temperature=getattr(generation_config, 'temperature', None) or getattr(self.config, 'temperature', 0.7),
+                top_p=getattr(generation_config, 'top_p', None) or getattr(self.config, 'top_p', 1.0),
+                max_tokens=getattr(generation_config, 'max_tokens', None) or getattr(self.config, 'max_input_tokens', 2048),
+                max_new_tokens=getattr(generation_config, 'max_new_tokens', None) or getattr(self.config, 'max_new_tokens', 2048)
             )[0]
             
             # Check for tool calls - unified logic
@@ -452,43 +467,17 @@ class LLMAgent:
     
     def generate(self, prompt: str, **kwargs) -> str:
         """Simple generation without chat history (bare model mode)"""
+        agent_config = getattr(self.config, 'agent_config', None)
+        generation_config = getattr(agent_config, 'generation', None)
+        
         return self.backend.generate(
             [prompt],
-            temperature=kwargs.get('temperature', self.config.temperature),
-            top_p=kwargs.get('top_p', self.config.top_p),
-            max_tokens=kwargs.get('max_tokens', self.config.max_tokens),
-            max_new_tokens=kwargs.get('max_new_tokens', self.config.max_new_tokens)
+            temperature=kwargs.get('temperature', getattr(generation_config, 'temperature', None) or getattr(self.config, 'temperature', 0.7)),
+            top_p=kwargs.get('top_p', getattr(generation_config, 'top_p', None) or getattr(self.config, 'top_p', 1.0)),
+            max_tokens=kwargs.get('max_tokens', getattr(generation_config, 'max_tokens', None) or getattr(self.config, 'max_input_tokens', 2048)),
+            max_new_tokens=kwargs.get('max_new_tokens', getattr(generation_config, 'max_new_tokens', None) or getattr(self.config, 'max_new_tokens', 2048))
         )[0]
     
-    def solve_with_dataset(
-        self,
-        example: Dict[str, Any],
-        dataset_loader: Any,
-        use_tools: Optional[bool] = None,
-        max_iterations: Optional[int] = None
-    ) -> str:
-        """
-        Solve a dataset example using dataset-specific prompt formatting and optional tools.
-        
-        This is a convenience method that combines build_prompt_with_dataset and chat
-        to provide a simple interface for solving dataset examples.
-        
-        Args:
-            example: Example dict with 'question', 'context', etc.
-            dataset_loader: DatasetLoader instance for dataset-specific prompt building
-            use_tools: Whether to use tools (defaults to config.enable_tools)
-            max_iterations: Maximum tool call iterations (defaults to config.max_tool_iterations)
-        
-        Returns:
-            Final answer string
-        """
-        return self.chat(
-            message="",  # Will be built from example and dataset_loader
-            use_tools=use_tools,
-            max_iterations=max_iterations,
-            dataset_loader=dataset_loader,
-            example=example
-        )
     
     def reset_conversation(self):
         """Reset conversation history"""

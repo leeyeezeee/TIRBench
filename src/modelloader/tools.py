@@ -1,6 +1,13 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 import os
+import sys
+from pathlib import Path
+
+# Add agentic_reasoning scripts to path for imports
+_AGENTIC_REASONING_PATH = Path(__file__).parent / "Agentic-Reasoning" / "scripts"
+if _AGENTIC_REASONING_PATH.exists():
+    sys.path.insert(0, str(_AGENTIC_REASONING_PATH))
 
 
 class Tool(ABC):
@@ -56,8 +63,25 @@ class CodeAgentTool(Tool):
                 from langchain.chat_models import ChatOpenAI
                 self.code_llm = ChatOpenAI(model_name=model_name, temperature=0.7, streaming=True)
         except ImportError as e:
-            raise ImportError(f"Failed to import code generation model dependencies: {e}. "
-                            f"Make sure agentic_reasoning is properly set up.")
+            # Fallback: try using OpenAI client directly
+            try:
+                if 'gpt' in model_name.lower():
+                    from openai import OpenAI
+                    api_key = os.getenv("OPENAI_API_KEY")
+                    base_url = os.getenv("OPENAI_BASE_URL")
+                    client_kwargs = {}
+                    if api_key:
+                        client_kwargs["api_key"] = api_key
+                    if base_url:
+                        client_kwargs["base_url"] = base_url
+                    self.code_llm = OpenAI(**client_kwargs) if client_kwargs else OpenAI()
+                    self.code_llm_model_name = model_name
+                else:
+                    from langchain.chat_models import ChatOpenAI
+                    self.code_llm = ChatOpenAI(model_name=model_name, temperature=0.7, streaming=True)
+            except ImportError:
+                raise ImportError(f"Failed to import code generation model dependencies: {e}. "
+                                f"Make sure agentic_reasoning is properly set up or install openai/langchain.")
     
     def _get_parameters(self) -> Dict[str, Any]:
         return {
@@ -79,19 +103,35 @@ class CodeAgentTool(Tool):
         """Generate and execute code"""
         import subprocess
         
-        # Generate code
-        prompt = f"Given the Context: {context}\n\nWrite a code snippet in Python for the given Problem. Make sure it can be run as a script and directly output the result. OUTPUT JUST CODE SNIPPET AND NOTHING ELSE. Problem: {query}"
+        # Generate code - use the same prompt format as run_code.py
+        prompt = "Given the Context: {}\n\n Write a code snippet in Python for the given Problem. Make sure it can be run as a script and directly output the result. OUTPUT JUST CODE SNIPPET AND NOTHING ELSE. Problem:{}".format(context, query)
         
-        if hasattr(self, 'code_llm'):
-            if hasattr(self.code_llm, 'invoke'):
-                result = self.code_llm.invoke(prompt).content
-            else:
-                result = self.code_llm.generate([prompt])[0].outputs[0].text
-        else:
-            # Fallback: return error
+        if not hasattr(self, 'code_llm'):
             return f"[ERROR] Code generation model not initialized. Please provide model_name."
         
-        # Clean markdown
+        # Handle different LLM interfaces
+        try:
+            if hasattr(self.code_llm, 'invoke'):
+                # RemoteAPILLM or ChatOpenAI interface
+                result = self.code_llm.invoke(prompt).content
+            elif hasattr(self.code_llm, 'chat') and hasattr(self.code_llm.chat, 'completions'):
+                # Direct OpenAI client interface
+                response = self.code_llm.chat.completions.create(
+                    model=getattr(self, 'code_llm_model_name', 'gpt-4o'),
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=2000,
+                )
+                result = response.choices[0].message.content
+            elif hasattr(self.code_llm, 'generate'):
+                # RemoteAPILLM generate interface
+                result = self.code_llm.generate([prompt])[0].outputs[0].text
+            else:
+                return f"[ERROR] Unsupported code generation model interface."
+        except Exception as e:
+            return f"[ERROR] Code generation failed: {str(e)}"
+        
+        # Clean markdown - same as run_code.py
         if "```python" in result:
             result = result[result.find("```python") + 9:result.rfind("```")].strip()
         elif "```" in result:
@@ -162,6 +202,7 @@ class SearchAgentTool(Tool):
         try:
             from tools.bing_search import bing_web_search, extract_relevant_info
             
+            # Perform Bing search
             results = bing_web_search(
                 query,
                 self.bing_subscription_key,
@@ -169,14 +210,17 @@ class SearchAgentTool(Tool):
                 market='en-US',
                 language='en'
             )
+            
+            # Extract relevant information
             relevant_info = extract_relevant_info(results)[:self.top_k]
             
-            # Format results
+            # Format results - same format as bing_search.py example
             formatted = "\n".join([
                 f"{i+1}. {info.get('title', '')}\n   {info.get('snippet', '')}\n   URL: {info.get('url', '')}"
                 for i, info in enumerate(relevant_info)
             ])
             
+            # Cache the formatted results
             self.search_cache[query] = formatted
             return formatted
         except ImportError as e:
@@ -194,12 +238,15 @@ class MindMapTool(Tool):
             description="Query and update a knowledge graph / mind map for structured knowledge retrieval"
         )
         self.working_dir = working_dir
+        self.mind_map = None
         try:
             from tools.creat_graph import MindMap
+            # Initialize MindMap with initial content and working directory
             self.mind_map = MindMap(ini_content=initial_content, working_dir=working_dir)
         except ImportError as e:
-            self.mind_map = None
-            print(f"Warning: MindMap not available: {e}")
+            print(f"Warning: MindMap not available: {e}. Please install nano_graphrag.")
+        except Exception as e:
+            print(f"Warning: Failed to initialize MindMap: {e}")
     
     def _get_parameters(self) -> Dict[str, Any]:
         return {
@@ -223,11 +270,11 @@ class MindMapTool(Tool):
             return "[ERROR] MindMap module not available. Please install nano_graphrag."
         
         try:
-            # Insert content into graph if provided
+            # Insert content into graph if provided (using graph_func.insert as in creat_graph.py)
             if insert:
                 self.mind_map.graph_func.insert(insert)
             
-            # Query the graph
+            # Query the graph using graph_retrieval method (same as creat_graph.py)
             result = self.mind_map.graph_retrieval(query)
             return str(result)
         except Exception as e:
